@@ -1,0 +1,61 @@
+/// Default network port. Change here and `DEFAULT_BIND_ADDRESS` /
+/// `DEFAULT_PUBLIC_URL` must stay in sync (guarded by a test below).
+pub const DEFAULT_PORT: u16 = 8840;
+pub const DEFAULT_BIND_ADDRESS: &str = "127.0.0.1:8840";
+pub const DEFAULT_PUBLIC_URL: &str = "http://localhost:8840";
+pub const SERVER_HOST_PLACEHOLDER: &str = "SERVER_HOST";
+pub const DATA_DIRECTORY_NAME: &str = ".dopbase";
+pub const DATABASE_FILENAME: &str = "dopbase.db";
+pub const CLIENT_CONFIG_FILENAME: &str = "config.toml";
+pub const MASTER_KEY_FILENAME: &str = "master.key";
+pub const SERVER_CONFIG_FILENAME: &str = "server.toml";
+pub const DAEMON_PID_FILENAME: &str = "dopbase.pid";
+pub const DAEMON_LOG_FILENAME: &str = "serve.log";
+
+pub const ENV_DATA_DIR: &str = "DOPBASE_DATA_DIR";
+pub const ENV_DOCS: &str = "DOPBASE_DOCS";
+pub const ENV_WEB_UI: &str = "DOPBASE_WEB_UI";
+pub const ENV_HOST: &str = "DOPBASE_HOST";
+pub const ENV_MASTER_KEY_PATH: &str = "DOPBASE_MASTER_KEY_PATH";
+pub const ENV_PORT: &str = "DOPBASE_PORT";
+pub const ENV_PUBLIC_URL: &str = "DOPBASE_PUBLIC_URL";
+pub const ENV_ROOT_EMAIL: &str = "DOPBASE_ROOT_EMAIL";
+pub const ENV_RUN_ENVIRONMENT: &str = "DOPBASE_ENV";
+pub const ENV_SERVER_URL: &str = "DOPBASE_URL";
+pub const ENV_SHUTDOWN_GRACE_SECONDS: &str = "DOPBASE_SHUTDOWN_GRACE_SECONDS";
+pub const ENV_TOKEN: &str = "DOPBASE_TOKEN";
+
+/// Every environment variable read by the Dopbase executable.
+pub const fn executable_environment_names() -> [&'static str; 12] {
+  [
+    ENV_TOKEN,
+    ENV_SERVER_URL,
+    ENV_RUN_ENVIRONMENT,
+    ENV_ROOT_EMAIL,
+    ENV_DATA_DIR,
+    ENV_HOST,
+    ENV_PORT,
+    ENV_PUBLIC_URL,
+    ENV_DOCS,
+    ENV_WEB_UI,
+    ENV_MASTER_KEY_PATH,
+    ENV_SHUTDOWN_GRACE_SECONDS,
+  ]
+}
+
+/// Every `DOPBASE_*` environment variable the server configuration reads.
+/// The background server strips these from its child process so the daemon
+/// resolves its configuration from the captured launch inputs.
+pub const fn daemon_environment_names() -> [&'static str; 9] {
+  [
+    ENV_DATA_DIR,
+    ENV_DOCS,
+    ENV_WEB_UI,
+    ENV_HOST,
+    ENV_MASTER_KEY_PATH,
+    ENV_PORT,
+    ENV_PUBLIC_URL,
+    ENV_SERVER_URL,
+    ENV_SHUTDOWN_GRACE_SECONDS,
+  ]
+}

@@ -1,0 +1,57 @@
+---
+title: "Audit events"
+description: "See which sensitive actions Dopbase records, who performed them, where they happened, and which secret data is excluded."
+---
+
+# Audit events
+
+Audit records answer who performed a sensitive action, where it happened, and when. They describe the action without storing the secret value involved.
+
+## Audit events in {{version}}
+
+| Area                  | Events                                                                                                                                              |
+| --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Secrets               | `secret.created`, `secret.updated`, `secret.deleted`, `secret.version.deleted`, `secret.revealed`, `secret.imported`, `secret.exported`, `secret.runtime_accessed` |
+| Vault files           | `vault.folder.created`, `vault.folder.moved`, `vault.folder.deleted`, `vault.file.created`, `vault.file.updated`, `vault.file.deleted`, `vault.file_version.deleted` |
+| Projects              | `project.created`, `project.renamed`, `project.deleted`, `project.initialized`                                                                      |
+| Environments          | `environment.created`, `environment.renamed`, `environment.deleted`                                                                                 |
+| Runner tokens         | `token.created`, `token.revoked`                                                                                                                    |
+| Authentication        | `login.succeeded`, `login.failed`, `logout.succeeded`                                                                                               |
+| Administrator & users | `admin.bootstrapped`, `admin.created`, `admin.updated`, `admin.deleted`, `admin.reauthenticated`, `admin.password_changed`                          |
+| AI service accounts   | `service_account.created`, `service_account.deleted`, `service_account.token_created`, `service_account.token_revoked`                              |
+| Backups               | `backup.created`, `backup.downloaded`, `backup.uploaded`, `backup.restored`, `backup.deleted`, `master_key.downloaded`, `backup.restored_bootstrap` |
+
+The API schema defines the event names used by this release.
+
+## Record contents
+
+Root and admin can review user, AI account, and backup history in the Audit page.
+
+An audit record may contain:
+
+```text
+timestamp
+actor
+action
+organization
+project
+environment
+secret key
+IP address
+user agent
+```
+
+It must never contain the plaintext secret value, a usable authentication token, or a request body that carries credentials.
+
+## Example
+
+```text
+2026-08-27 14:23
+actor: alice@example.com
+action: secret.updated
+project: payment-service
+environment: production
+secret: DATABASE_URL
+```
+
+Retention, export, advanced filtering, and additional integrity guarantees remain roadmap work.

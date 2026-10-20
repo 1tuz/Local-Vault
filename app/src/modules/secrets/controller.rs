@@ -1,0 +1,350 @@
+use super::{error::SecretError, model::*, service};
+use crate::{
+  extractors::{require_mutation, require_ui_mutation},
+  http::{HttpResponse, HttpResponseFormat},
+  models::AuthIdentity,
+  state::AppState,
+};
+use axum::{
+  extract::{Path, State},
+  http::HeaderMap,
+};
+
+/// List secret metadata
+///
+/// Return the keys, versions, and timestamps of every secret in the
+/// environment. Values are never included.
+#[utoipa::path(
+  get,
+  path = crate::constants::api::secrets::COLLECTION,
+  tag = "secrets",
+  security(("bearerAuth" = []), ("cookieAuth" = [])),
+  params(("environment_id" = String, Path, description = "Environment id")),
+  responses(
+    (status = 200, description = "Secret metadata fetched", body = inline(HttpResponseFormat<Vec<SecretMetadata>>)),
+    (status = 401, description = "Authentication is required", body = crate::http::ErrorBody),
+    (status = 403, description = "Only administrators may list secrets", body = crate::http::ErrorBody),
+    (status = 404, description = "The environment was not found", body = crate::http::ErrorBody),
+  ),
+)]
+pub async fn list(
+  State(state): State<AppState>,
+  identity: AuthIdentity,
+  Path(id): Path<String>,
+) -> Result<HttpResponse<Vec<SecretMetadata>>, SecretError> {
+  Ok(HttpResponse::ok(
+    service::list(&state, &identity, &id).await?,
+    "SECRETS_FETCHED",
+  ))
+}
+
+/// Get secret metadata
+///
+/// Return the metadata of one secret. Values are never included.
+#[utoipa::path(
+  get,
+  path = crate::constants::api::secrets::ITEM,
+  tag = "secrets",
+  security(("bearerAuth" = []), ("cookieAuth" = [])),
+  params(("environment_id" = String, Path, description = "Environment id"), ("key" = String, Path, description = "Secret key")),
+  responses(
+    (status = 200, description = "Secret metadata fetched", body = inline(HttpResponseFormat<SecretMetadata>)),
+    (status = 401, description = "Authentication is required", body = crate::http::ErrorBody),
+    (status = 403, description = "Only administrators may view secrets", body = crate::http::ErrorBody),
+    (status = 404, description = "The secret or environment was not found", body = crate::http::ErrorBody),
+  ),
+)]
+pub async fn get(
+  State(state): State<AppState>,
+  identity: AuthIdentity,
+  Path((id, key)): Path<(String, String)>,
+) -> Result<HttpResponse<SecretMetadata>, SecretError> {
+  Ok(HttpResponse::ok(
+    service::get(&state, &identity, &id, &key).await?,
+    "SECRET_FETCHED",
+  ))
+}
+
+/// List retained secret versions without revealing their values.
+#[utoipa::path(
+  get,
+  path = crate::constants::api::secrets::VERSIONS,
+  tag = "secrets",
+  security(("bearerAuth" = []), ("cookieAuth" = [])),
+  params(("environment_id" = String, Path), ("key" = String, Path)),
+  responses((status = 200, description = "Secret version metadata fetched", body = inline(HttpResponseFormat<Vec<SecretVersionMetadata>>)))
+)]
+pub async fn versions(
+  State(state): State<AppState>,
+  identity: AuthIdentity,
+  Path((id, key)): Path<(String, String)>,
+) -> Result<HttpResponse<Vec<SecretVersionMetadata>>, SecretError> {
+  Ok(HttpResponse::ok(
+    service::versions(&state, &identity, &id, &key).await?,
+    "SECRET_VERSIONS_FETCHED",
+  ))
+}
+
+/// Permanently remove an archived version from the Admin UI.
+#[utoipa::path(
+  delete,
+  path = crate::constants::api::secrets::VERSION,
+  tag = "secrets",
+  security(("bearerAuth" = []), ("cookieAuth" = [])),
+  params(("environment_id" = String, Path), ("key" = String, Path), ("version" = i64, Path)),
+  responses((status = 200, description = "Archived secret version deleted", body = inline(HttpResponseFormat<serde_json::Value>)))
+)]
+pub async fn delete_version(
+  State(state): State<AppState>,
+  headers: HeaderMap,
+  identity: AuthIdentity,
+  Path((id, key, version)): Path<(String, String, i64)>,
+) -> Result<HttpResponse<serde_json::Value>, SecretError> {
+  require_ui_mutation(&identity, &headers)?;
+  service::delete_version(&state, &identity, &id, &key, version).await?;
+  Ok(HttpResponse::done("SECRET_VERSION_DELETED"))
+}
+
+/// Restore an older secret value as a new current version.
+#[utoipa::path(
+  post,
+  path = crate::constants::api::secrets::ROLLBACK,
+  tag = "secrets",
+  security(("bearerAuth" = []), ("cookieAuth" = [])),
+  params(("environment_id" = String, Path), ("key" = String, Path)),
+  request_body = RollbackSecretRequest,
+  responses((status = 200, description = "Older secret value restored as a new version", body = inline(HttpResponseFormat<SecretMetadata>)))
+)]
+pub async fn rollback(
+  State(state): State<AppState>,
+  headers: HeaderMap,
+  identity: AuthIdentity,
+  Path((id, key)): Path<(String, String)>,
+  axum::Json(request): axum::Json<RollbackSecretRequest>,
+) -> Result<HttpResponse<SecretMetadata>, SecretError> {
+  service::authorize_write(&state, &identity, &headers, &id).await?;
+  Ok(HttpResponse::ok(
+    service::rollback(&state, &identity, &id, &key, request.version).await?,
+    "SECRET_ROLLED_BACK",
+  ))
+}
+
+/// Set a secret
+///
+/// Create the secret or store a new encrypted version of its value.
+/// Requires the CSRF header for browser sessions.
+#[utoipa::path(
+  put,
+  path = crate::constants::api::secrets::ITEM,
+  tag = "secrets",
+  security(("bearerAuth" = []), ("cookieAuth" = [])),
+  params(("environment_id" = String, Path, description = "Environment id"), ("key" = String, Path, description = "Secret key")),
+  request_body = SetSecretRequest,
+  responses(
+    (status = 200, description = "Secret stored. The new metadata is returned", body = inline(HttpResponseFormat<SecretMetadata>)),
+    (status = 401, description = "Authentication is required", body = crate::http::ErrorBody),
+    (status = 403, description = "Administrator with a valid CSRF token is required", body = crate::http::ErrorBody),
+    (status = 404, description = "The environment was not found", body = crate::http::ErrorBody),
+    (status = 422, description = "The secret key or value is invalid", body = crate::http::ErrorBody),
+  ),
+)]
+pub async fn set(
+  State(state): State<AppState>,
+  headers: HeaderMap,
+  identity: AuthIdentity,
+  Path((id, key)): Path<(String, String)>,
+  axum::Json(request): axum::Json<SetSecretRequest>,
+) -> Result<HttpResponse<SecretMetadata>, SecretError> {
+  service::authorize_write(&state, &identity, &headers, &id).await?;
+  Ok(HttpResponse::ok(
+    service::set(&state, &identity, &id, key, request).await?,
+    "SECRET_SAVED",
+  ))
+}
+
+/// Delete a secret
+///
+/// Remove the secret and all of its versions. Requires the CSRF header
+/// for browser sessions.
+#[utoipa::path(
+  delete,
+  path = crate::constants::api::secrets::ITEM,
+  tag = "secrets",
+  security(("bearerAuth" = []), ("cookieAuth" = [])),
+  params(("environment_id" = String, Path, description = "Environment id"), ("key" = String, Path, description = "Secret key")),
+  responses(
+    (status = 200, description = "Secret deleted", body = inline(HttpResponseFormat<serde_json::Value>)),
+    (status = 401, description = "Authentication is required", body = crate::http::ErrorBody),
+    (status = 403, description = "Administrator with a valid CSRF token is required", body = crate::http::ErrorBody),
+    (status = 404, description = "The secret or environment was not found", body = crate::http::ErrorBody),
+  ),
+)]
+pub async fn delete(
+  State(state): State<AppState>,
+  headers: HeaderMap,
+  identity: AuthIdentity,
+  Path((id, key)): Path<(String, String)>,
+) -> Result<HttpResponse<serde_json::Value>, SecretError> {
+  require_ui_mutation(&identity, &headers)?;
+  service::delete(&state, &identity, &id, &key).await?;
+  Ok(HttpResponse::done("SECRET_DELETED"))
+}
+
+/// Reveal a secret value
+///
+/// Decrypt and return a secret value to an authenticated project manager.
+/// Browser sessions require the CSRF header. The access is recorded in the
+/// audit log.
+#[utoipa::path(
+  post,
+  path = crate::constants::api::secrets::REVEAL,
+  tag = "secrets",
+  security(("bearerAuth" = []), ("cookieAuth" = [])),
+  params(("environment_id" = String, Path, description = "Environment id"), ("key" = String, Path, description = "Secret key")),
+  responses(
+    (status = 200, description = "Secret value revealed", body = inline(HttpResponseFormat<RevealedSecret>)),
+    (status = 401, description = "Authentication is required", body = crate::http::ErrorBody),
+    (status = 403, description = "Project access or a valid CSRF token is required", body = crate::http::ErrorBody),
+    (status = 404, description = "The secret or environment was not found", body = crate::http::ErrorBody),
+  ),
+)]
+pub async fn reveal(
+  State(state): State<AppState>,
+  headers: HeaderMap,
+  identity: AuthIdentity,
+  Path((id, key)): Path<(String, String)>,
+) -> Result<HttpResponse<RevealedSecret>, SecretError> {
+  require_mutation(&identity, &headers)?;
+  Ok(HttpResponse::ok(
+    service::reveal(&state, &identity, &id, &key).await?,
+    "SECRET_REVEALED",
+  ))
+}
+
+/// Import secrets
+///
+/// Merge or replace a batch of secrets, optionally as a dry run that only
+/// reports what would change. Expected revisions are checked during both
+/// preview and apply. Requires the CSRF header for browser sessions.
+#[utoipa::path(
+  post,
+  path = crate::constants::api::secrets::IMPORT,
+  tag = "secrets",
+  security(("bearerAuth" = []), ("cookieAuth" = [])),
+  params(("environment_id" = String, Path, description = "Environment id")),
+  request_body = ImportSecretsRequest,
+  responses(
+    (status = 200, description = "Import applied, or previewed when dry run. Added, updated, unchanged, and deleted keys are returned", body = inline(HttpResponseFormat<ImportSecretsResponse>)),
+    (status = 401, description = "Authentication is required", body = crate::http::ErrorBody),
+    (status = 403, description = "Administrator with a valid CSRF token is required", body = crate::http::ErrorBody),
+    (status = 404, description = "The environment was not found", body = crate::http::ErrorBody),
+    (status = 409, description = "A replace preview is required, or the supplied revision is stale", body = crate::http::ErrorBody),
+    (status = 422, description = "A key, value, or layout is invalid, a key is duplicated, or a limit is exceeded", body = crate::http::ErrorBody),
+  ),
+)]
+pub async fn import(
+  State(state): State<AppState>,
+  headers: HeaderMap,
+  identity: AuthIdentity,
+  Path(id): Path<String>,
+  axum::Json(request): axum::Json<ImportSecretsRequest>,
+) -> Result<HttpResponse<ImportSecretsResponse>, SecretError> {
+  require_mutation(&identity, &headers)?;
+  Ok(HttpResponse::ok(
+    service::import(&state, &identity, &id, request).await?,
+    "SECRETS_IMPORTED",
+  ))
+}
+
+/// Get the .env editor layout
+///
+/// Return the stored `.env` layout for the environment (comments,
+/// ordering, blank `KEY=` slots). Contains no secret values, so no recent
+/// authentication is required.
+#[utoipa::path(
+  get,
+  path = crate::constants::api::secrets::LAYOUT,
+  tag = "secrets",
+  security(("bearerAuth" = []), ("cookieAuth" = [])),
+  params(("environment_id" = String, Path, description = "Environment id")),
+  responses(
+    (status = 200, description = "Layout fetched", body = inline(HttpResponseFormat<EnvLayoutResponse>)),
+    (status = 401, description = "Authentication is required", body = crate::http::ErrorBody),
+    (status = 403, description = "Only administrators may view the layout", body = crate::http::ErrorBody),
+    (status = 404, description = "The environment was not found", body = crate::http::ErrorBody),
+  ),
+)]
+pub async fn layout(
+  State(state): State<AppState>,
+  identity: AuthIdentity,
+  Path(id): Path<String>,
+) -> Result<HttpResponse<EnvLayoutResponse>, SecretError> {
+  Ok(HttpResponse::ok(
+    service::layout(&state, &identity, &id).await?,
+    "SECRETS_LAYOUT_FETCHED",
+  ))
+}
+
+/// Export all secrets
+///
+/// Decrypt and return every secret with layout and revision from one snapshot.
+/// Browser sessions require recent password authentication and the CSRF header.
+/// Runner tokens may export only their assigned environment.
+/// Every successful export is recorded in the audit log.
+#[utoipa::path(
+  post,
+  path = crate::constants::api::secrets::EXPORT,
+  tag = "secrets",
+  security(("bearerAuth" = []), ("cookieAuth" = [])),
+  params(("environment_id" = String, Path, description = "Environment id")),
+  responses(
+    (status = 200, description = "Secrets, layout, and collection revision exported from one snapshot", body = inline(HttpResponseFormat<ExportSecretsResponse>)),
+    (status = 401, description = "Authentication is required", body = crate::http::ErrorBody),
+    (status = 403, description = "Runner scope or human authentication requirements were not met", body = crate::http::ErrorBody),
+    (status = 404, description = "The environment was not found", body = crate::http::ErrorBody),
+  ),
+)]
+pub async fn export(
+  State(state): State<AppState>,
+  headers: HeaderMap,
+  identity: AuthIdentity,
+  Path(id): Path<String>,
+) -> Result<HttpResponse<ExportSecretsResponse>, SecretError> {
+  if !matches!(identity, AuthIdentity::Runner { .. }) {
+    require_mutation(&identity, &headers)?;
+  }
+  Ok(HttpResponse::ok(
+    service::export(&state, &identity, &id).await?,
+    "SECRETS_EXPORTED",
+  ))
+}
+
+/// Fetch runtime secrets
+///
+/// Return every decrypted secret of an environment for use by a runner.
+/// Administrators may fetch any environment. Runner tokens are restricted
+/// to the environment their token belongs to. The access is recorded in
+/// the audit log.
+#[utoipa::path(
+  get,
+  path = crate::constants::api::secrets::RUNTIME,
+  tag = "secrets",
+  security(("bearerAuth" = [])),
+  params(("environment_id" = String, Path, description = "Environment id")),
+  responses(
+    (status = 200, description = "Runtime secrets fetched", body = inline(HttpResponseFormat<RuntimeSecretsResponse>)),
+    (status = 401, description = "Authentication is required", body = crate::http::ErrorBody),
+    (status = 403, description = "The runner token cannot access this environment", body = crate::http::ErrorBody),
+    (status = 404, description = "The environment was not found", body = crate::http::ErrorBody),
+  ),
+)]
+pub async fn runtime(
+  State(state): State<AppState>,
+  identity: AuthIdentity,
+  Path(id): Path<String>,
+) -> Result<HttpResponse<RuntimeSecretsResponse>, SecretError> {
+  Ok(HttpResponse::ok(
+    service::runtime(&state, &identity, &id).await?,
+    "RUNTIME_SECRETS_FETCHED",
+  ))
+}

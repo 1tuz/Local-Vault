@@ -1,0 +1,655 @@
+mod instance;
+pub(crate) mod provision;
+
+pub(crate) use instance::require_uninitialized;
+pub use instance::{InitializationRequired, require_initialized};
+
+use std::{
+  fs::{File, OpenOptions},
+  sync::Arc,
+  time::Duration,
+};
+
+use anstyle::{AnsiColor, Color, Effects, Style};
+use anyhow::{Context, Result};
+use axum::{
+  Router,
+  extract::DefaultBodyLimit,
+  http::{HeaderName, Request, StatusCode, Uri},
+  middleware,
+  middleware::Next,
+  response::{IntoResponse, Response},
+};
+use tower_http::{
+  request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
+  timeout::TimeoutLayer,
+  trace::TraceLayer,
+};
+use utoipa::openapi::security::{ApiKey, ApiKeyValue, Http, HttpAuthScheme, SecurityScheme};
+use utoipa_swagger_ui::SwaggerUi;
+
+use crate::{
+  config::{ServerConfig, database_path, ensure_data_dir},
+  constants::{
+    api,
+    errors::{INTERNAL_ERROR, REQUEST_INVALID},
+  },
+  http::HttpError,
+  middlewares, modules,
+  services::{cache::RateLimiter, crypto::CryptoService, db::DbClient, token},
+  state::{AppState, SetupState},
+};
+
+/// Build runtime state for an initialized instance.
+pub async fn build_state(config: ServerConfig) -> Result<AppState> {
+  require_initialized(&config).await?;
+  build_instance_state(config, false).await
+}
+
+/// Build state for an explicitly requested web setup or an isolated setup fixture.
+pub async fn build_setup_state(config: ServerConfig) -> Result<AppState> {
+  build_instance_state(config, true).await
+}
+
+pub(crate) async fn prepare_instance(config: &ServerConfig) -> Result<(DbClient, CryptoService)> {
+  ensure_data_dir(&config.data_dir)?;
+  let db = DbClient::connect(&config.database_url)
+    .await
+    .context("failed to open SQLite")?;
+  db.migrate()
+    .await
+    .context("failed to run database migrations")?;
+  let crypto = CryptoService::initialize(db.pool(), &config.master_key.path)
+    .await
+    .context("failed to initialize master key")?;
+  let reset_marker = config.data_dir.join(".factory-reset.pending");
+  if reset_marker.exists() {
+    // A reset marker is durable intent. Re-run the database phase during setup
+    // so a process crash cannot leave a partially reset instance usable.
+    let mut tx = db.pool().begin().await?;
+    for table in [
+      "audit_events",
+      "runner_tokens",
+      "agent_tokens",
+      "secrets",
+      "environment_env_layout",
+      "environments",
+      "projects",
+      "sessions",
+      "service_accounts",
+      "admins",
+    ] {
+      sqlx::query(&format!("DELETE FROM {table}"))
+        .execute(&mut *tx)
+        .await
+        .with_context(|| format!("failed to resume factory reset for {table}"))?;
+    }
+    tx.commit()
+      .await
+      .context("failed to commit resumed factory reset")?;
+    let backup_dir = config.data_dir.join("backups");
+    if let Ok(entries) = std::fs::read_dir(&backup_dir) {
+      for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "dop") {
+          std::fs::remove_file(&path)
+            .with_context(|| format!("failed to remove reset backup {}", path.display()))?;
+        }
+      }
+    }
+    std::fs::remove_file(&reset_marker)
+      .with_context(|| format!("failed to clear reset marker {}", reset_marker.display()))?;
+  }
+  Ok((db, crypto))
+}
+
+async fn build_instance_state(
+  config: ServerConfig,
+  setup_enabled: bool,
+) -> Result<AppState> {
+  let (db, crypto) = prepare_instance(&config).await?;
+  let admin_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM admins")
+    .fetch_one(db.pool())
+    .await?;
+  let setup_token = if setup_enabled && admin_count == 0 {
+    Some(token::generate("setup_")?)
+  } else {
+    None
+  };
+  Ok(AppState {
+    config: Arc::new(config),
+    db,
+    crypto,
+    setup: Arc::new(tokio::sync::RwLock::new(SetupState { token: setup_token })),
+    rate_limiter: RateLimiter::default(),
+    maintenance: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    started_at: std::time::Instant::now(),
+  })
+}
+
+pub fn router(state: AppState) -> Router {
+  let request_id = HeaderName::from_static("x-request-id");
+  let mut router = Router::new().merge(modules::routes());
+  if state.config.docs_enabled {
+    let mut openapi = modules::openapi();
+    openapi.info.title = "Dopbase API".to_string();
+    openapi.info.description = Some(
+      "API for managing Dopbase projects, environments, secrets, access, backups, and instance settings."
+        .to_string(),
+    );
+    let components = openapi.components.get_or_insert_with(Default::default);
+    components.add_security_scheme(
+      "bearerAuth",
+      SecurityScheme::Http(Http::new(HttpAuthScheme::Bearer)),
+    );
+    components.add_security_scheme(
+      "cookieAuth",
+      SecurityScheme::ApiKey(ApiKey::Cookie(ApiKeyValue::new("dopbase_session"))),
+    );
+    components.add_security_scheme(
+      "csrfHeader",
+      SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::new("X-Dopbase-CSRF"))),
+    );
+    router = router.merge(SwaggerUi::new(api::docs::UI).url(api::docs::OPENAPI, openapi));
+  }
+  router
+    .fallback(static_fallback)
+    .layer(DefaultBodyLimit::max(3 * 1024 * 1024))
+    .layer(TimeoutLayer::with_status_code(
+      StatusCode::REQUEST_TIMEOUT,
+      Duration::from_secs(30),
+    ))
+    .layer(TraceLayer::new_for_http())
+    .layer(PropagateRequestIdLayer::new(request_id.clone()))
+    .layer(SetRequestIdLayer::new(request_id, MakeRequestUuid))
+    .layer(middleware::map_response(normalize_error_response))
+    .layer(middleware::from_fn_with_state(
+      state.clone(),
+      maintenance_gate,
+    ))
+    .layer(axum::middleware::from_fn(middlewares::security::headers))
+    .with_state(state)
+}
+
+async fn maintenance_gate(
+  axum::extract::State(state): axum::extract::State<AppState>,
+  request: Request<axum::body::Body>,
+  next: Next,
+) -> Response {
+  if state.maintenance.load(std::sync::atomic::Ordering::SeqCst)
+    && request.uri().path().starts_with(api::PREFIX)
+    && !request
+      .uri()
+      .path()
+      .starts_with(api::instance::FACTORY_RESET)
+  {
+    return HttpError::new(
+      StatusCode::SERVICE_UNAVAILABLE,
+      "INSTANCE_RESETTING",
+      "The instance is being reset. Please try again shortly.",
+    )
+    .into_response();
+  }
+  next.run(request).await
+}
+
+async fn normalize_error_response(response: Response) -> Response {
+  let status = response.status();
+  if !status.is_client_error() && !status.is_server_error() {
+    return response;
+  }
+  let is_json = response
+    .headers()
+    .get(axum::http::header::CONTENT_TYPE)
+    .and_then(|value| value.to_str().ok())
+    .is_some_and(|value| value.starts_with("application/json"));
+  if is_json {
+    return response;
+  }
+  let request_id = response.headers().get("x-request-id").cloned();
+  let error = if status.is_server_error() {
+    HttpError::new(status, INTERNAL_ERROR, "An internal error occurred.")
+  } else {
+    HttpError::new(
+      status,
+      REQUEST_INVALID,
+      "The request could not be processed.",
+    )
+  };
+  let mut normalized = error.into_response();
+  if let Some(request_id) = request_id {
+    normalized.headers_mut().insert("x-request-id", request_id);
+  }
+  normalized
+}
+
+pub async fn serve(config: ServerConfig) -> Result<()> {
+  serve_with_ready(config, None).await
+}
+
+/// Run the API and embedded UI inside a desktop host. The caller receives the
+/// bound loopback URL and first-run token only after the listener is ready.
+pub async fn serve_desktop(
+  mut config: ServerConfig,
+  ready: tokio::sync::oneshot::Sender<DesktopReady>,
+  shutdown: tokio::sync::oneshot::Receiver<()>,
+) -> Result<()> {
+  config.web_ui_enabled = true;
+  serve_instance(config, None, false, None, Some(ready), Some(shutdown)).await
+}
+
+#[derive(Debug)]
+pub struct DesktopReady {
+  pub url: String,
+  pub setup_token: Option<String>,
+}
+
+pub fn startup_banner(
+  public_url: &str,
+  bind_address: &str,
+  data_dir: &std::path::Path,
+  docs_enabled: bool,
+  web_ui_enabled: bool,
+) -> String {
+  let public_url = public_url.trim_end_matches('/');
+  let heading = Style::new().effects(Effects::BOLD);
+  let mut rows = vec![
+    format!("{heading}Dopbase{heading:#}"),
+    "Secure, Simple and Private".to_string(),
+    format!("Version {}", env!("CARGO_PKG_VERSION")),
+    String::new(),
+    format!("Public URL: {public_url}"),
+    format!("Bind:       {bind_address}"),
+    format!(
+      "Admin UI:   {}",
+      if web_ui_enabled {
+        public_url
+      } else {
+        "disabled"
+      }
+    ),
+    format!("API:        {public_url}/api/v1"),
+    format!("Config:     {}", data_dir.display()),
+  ];
+  if docs_enabled {
+    rows.push(format!("API Specs:  {public_url}/api/docs"));
+  }
+  rows.join("\n")
+}
+
+pub fn startup_warning(warning: &str) -> String {
+  let style = Style::new()
+    .fg_color(Some(Color::Ansi(AnsiColor::Yellow)))
+    .effects(Effects::BOLD);
+  format!("{style}Warning: {style:#}{warning}")
+}
+
+/// Formats the one-time setup token message shown on first run, including a
+/// one-click link that pre-fills the token input in the Admin UI. The token is
+/// appended to the URL fragment-free query so the browser can auto-fill it.
+pub fn setup_token_message(
+  public_url: &str,
+  token: &str,
+) -> String {
+  setup_token_message_with_email(public_url, token, None)
+}
+
+fn setup_token_message_with_email(
+  public_url: &str,
+  token: &str,
+  email: Option<&str>,
+) -> String {
+  let base = public_url.trim_end_matches('/');
+  let mut query = url::form_urlencoded::Serializer::new(String::new());
+  query.append_pair("token", token);
+  if let Some(email) = email {
+    query.append_pair("email", email);
+  }
+  let query = query.finish();
+  format!(
+    "\nDopbase setup token (shown once):\n{token}\n\nOr open this link to fill it in automatically:\n{base}/setup?{query}\n"
+  )
+}
+
+/// Run the server, optionally reporting readiness (or the startup failure) to
+/// the foreground command that spawned it in background mode.
+pub async fn serve_with_ready(
+  config: ServerConfig,
+  ready: Option<&crate::daemon::Ready>,
+) -> Result<()> {
+  serve_instance(config, ready, false, None, None, None).await
+}
+
+/// Run the existing foreground server with first-run web setup enabled.
+pub(crate) async fn serve_setup(
+  mut config: ServerConfig,
+  email: Option<&str>,
+) -> Result<()> {
+  config.web_ui_enabled = true;
+  serve_instance(config, None, true, email, None, None).await
+}
+
+async fn serve_instance(
+  config: ServerConfig,
+  ready: Option<&crate::daemon::Ready>,
+  setup_enabled: bool,
+  setup_email: Option<&str>,
+  desktop_ready: Option<tokio::sync::oneshot::Sender<DesktopReady>>,
+  desktop_shutdown: Option<tokio::sync::oneshot::Receiver<()>>,
+) -> Result<()> {
+  use provision::{GeneratedSetup, StartupMode, cli_error, commit_root};
+  use zeroize::Zeroizing;
+
+  let mode = if setup_enabled {
+    require_uninitialized(&config).await?;
+    StartupMode::Web
+  } else {
+    provision::startup_mode(&config).await?
+  };
+  // Prepare credentials before creating files. Recheck state while holding the lock.
+  let mut prepared = if let StartupMode::Generated(email) = &mode {
+    let password = Zeroizing::new(token::generate("")?);
+    let credentials = modules::bootstrap::service::prepare_root(email, password.to_string())
+      .await
+      .map_err(cli_error)?;
+    Some((password, credentials))
+  } else {
+    None
+  };
+  ensure_data_dir(&config.data_dir)?;
+  let _lock = InstanceLock::acquire(&config.database_url)?;
+  let mode = if setup_enabled {
+    require_uninitialized(&config).await?;
+    StartupMode::Web
+  } else {
+    provision::startup_mode(&config).await?
+  };
+  // Bind before automatic account creation so a busy port cannot consume credentials.
+  let mut address = config.bind_addr()?;
+  let listener = if matches!(mode, StartupMode::Generated(_)) {
+    Some(
+      tokio::net::TcpListener::bind(address)
+        .await
+        .with_context(|| format!("failed to bind {address}"))?,
+    )
+  } else {
+    None
+  };
+  let mut state = match mode {
+    StartupMode::Runtime => build_state(config).await?,
+    StartupMode::Web => build_setup_state(config).await?,
+    StartupMode::Generated(_) => build_instance_state(config, false).await?,
+  };
+  let listener = match listener {
+    Some(listener) => listener,
+    None => tokio::net::TcpListener::bind(address)
+      .await
+      .with_context(|| format!("failed to bind {address}"))?,
+  };
+  if desktop_ready.is_some() {
+    address = listener.local_addr()?;
+    let config = std::sync::Arc::make_mut(&mut state.config);
+    config.bind_address = address.to_string();
+    config.public_url = format!("http://{address}");
+    config.public_url_source = crate::config::PublicUrlSource::Explicit;
+  }
+  state.config.ensure_reference_files()?;
+  let generated_setup = if let StartupMode::Generated(email) = mode {
+    let (password, credentials) = prepared
+      .take()
+      .context("missing prepared root credentials")?;
+    let admin_id = commit_root(&state.db, &credentials).await?;
+    let setup = GeneratedSetup {
+      initialized: true,
+      admin_id,
+      email,
+      data_dir: state.config.data_dir.clone(),
+      password,
+    };
+    state.setup.write().await.token = None;
+    if let Err(error) = state.db.checkpoint().await {
+      state.db.close().await;
+      return Err(setup.committed_error(
+        anyhow::Error::from(error).context("failed to checkpoint initialized storage"),
+      ));
+    }
+    Some(setup)
+  } else {
+    None
+  };
+  drop(prepared);
+  let setup_token = state.setup.read().await.token.clone();
+  if let Some(ready) = desktop_ready {
+    let _ = ready.send(DesktopReady {
+      url: state.config.public_url.clone(),
+      setup_token: setup_token.clone(),
+    });
+  }
+  let grace = state.config.shutdown_grace_seconds;
+  let daemonized = state.config.daemonized;
+  let _pid_file_lock = if daemonized {
+    match crate::daemon::write_pid_file_with_launch(
+      &crate::daemon::pid_file_path(&state.config.data_dir),
+      std::process::id(),
+      &state.config.bind_address,
+      &state.config.public_url,
+      state.config.daemon_launch.clone(),
+    ) {
+      Ok(lock) => Some(lock),
+      Err(error) => {
+        state.db.close().await;
+        return Err(match &generated_setup {
+          Some(setup) => setup.committed_error(error),
+          None => error,
+        });
+      }
+    }
+  } else {
+    None
+  };
+  if let Some(setup) = &generated_setup {
+    let delivered = if let Some(ready) = ready {
+      ready.ok_with_setup(std::process::id(), setup)
+    } else {
+      crate::cli::output::print_raw(&setup.human_output())
+    };
+    if let Err(error) = delivered {
+      if daemonized {
+        let _ =
+          crate::daemon::remove_pid_file(&crate::daemon::pid_file_path(&state.config.data_dir));
+      }
+      state.db.close().await;
+      return Err(setup.committed_error(error.context("failed to deliver setup output")));
+    }
+  } else if let Some(ready) = ready {
+    ready.ok(std::process::id(), setup_token.as_deref());
+  }
+  drop(generated_setup);
+  let public_url = state.config.public_url.trim_end_matches('/');
+  anstream::eprintln!(
+    "\n{}\n",
+    startup_banner(
+      public_url,
+      &state.config.bind_address,
+      &state.config.data_dir,
+      state.config.docs_enabled,
+      state.config.web_ui_enabled,
+    )
+  );
+  if let Some(warning) = state.config.public_url_warning() {
+    anstream::eprintln!("{}\n", startup_warning(&warning));
+  }
+  if desktop_shutdown.is_none()
+    && let Some(setup) = setup_token.as_deref()
+  {
+    eprintln!(
+      "{}",
+      setup_token_message_with_email(public_url, setup, setup_email)
+    );
+  }
+  tracing::info!(%address,"Dopbase server started");
+  let server = axum::serve(listener, router(state.clone()));
+  let serve_result = if let Some(shutdown) = desktop_shutdown {
+    server
+      .with_graceful_shutdown(async move {
+        let _ = shutdown.await;
+      })
+      .await
+  } else {
+    server.with_graceful_shutdown(shutdown_signal()).await
+  };
+  if daemonized {
+    let _ = crate::daemon::remove_pid_file(&crate::daemon::pid_file_path(&state.config.data_dir));
+  }
+  serve_result?;
+  if let Err(error) = state.db.checkpoint().await {
+    tracing::warn!(%error, "failed to checkpoint SQLite WAL during shutdown");
+  }
+  let _ = tokio::time::timeout(Duration::from_secs(grace), state.db.close()).await;
+  Ok(())
+}
+
+async fn shutdown_signal() {
+  let ctrl_c = async {
+    let _ = tokio::signal::ctrl_c().await;
+  };
+  #[cfg(unix)]
+  let terminate = async {
+    if let Ok(mut signal) =
+      tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    {
+      signal.recv().await;
+    } else {
+      std::future::pending::<()>().await;
+    }
+  };
+  #[cfg(not(unix))]
+  let terminate = std::future::pending::<()>();
+  tokio::select! {_=ctrl_c=>{},_=terminate=>{}}
+}
+
+pub struct InstanceLock {
+  file: File,
+}
+impl InstanceLock {
+  pub fn acquire(database_url: &str) -> Result<Option<Self>> {
+    if database_url.contains(":memory:") {
+      return Ok(None);
+    }
+    let file = Self::open(database_url)?;
+    file
+      .try_lock()
+      .context(
+        "Dopbase server is already running for this database. \nStop the running server before starting another one",
+      )?;
+    Ok(Some(Self { file }))
+  }
+
+  pub fn is_held(database_url: &str) -> Result<bool> {
+    if database_url.contains(":memory:") {
+      return Ok(false);
+    }
+    let path = Self::lock_path(database_url)?;
+    if !path.exists() {
+      return Ok(false);
+    }
+    let file = OpenOptions::new().read(true).write(true).open(path)?;
+    match file.try_lock() {
+      Ok(()) => {
+        file.unlock()?;
+        Ok(false)
+      }
+      Err(std::fs::TryLockError::WouldBlock) => Ok(true),
+      Err(std::fs::TryLockError::Error(error)) => {
+        Err(error).context("failed to inspect the Dopbase database lock")
+      }
+    }
+  }
+
+  fn open(database_url: &str) -> Result<File> {
+    let lock = Self::lock_path(database_url)?;
+    if let Some(parent) = lock.parent() {
+      std::fs::create_dir_all(parent)?;
+    }
+    let file = OpenOptions::new()
+      .create(true)
+      .truncate(false)
+      .read(true)
+      .write(true)
+      .open(&lock)?;
+    Ok(file)
+  }
+
+  fn lock_path(database_url: &str) -> Result<std::path::PathBuf> {
+    let database = database_path(database_url)?;
+    Ok(std::path::PathBuf::from(format!(
+      "{}.lock",
+      database.display()
+    )))
+  }
+}
+impl Drop for InstanceLock {
+  fn drop(&mut self) {
+    let _ = self.file.unlock();
+  }
+}
+
+async fn static_fallback(
+  axum::extract::State(state): axum::extract::State<AppState>,
+  uri: Uri,
+) -> Response {
+  if uri.path().starts_with(api::PREFIX) {
+    return HttpError::not_found(REQUEST_INVALID, "The requested API route was not found.")
+      .into_response();
+  }
+  if !state.config.web_ui_enabled {
+    return HttpError::not_found(REQUEST_INVALID, "The requested route was not found.")
+      .into_response();
+  }
+  embedded_asset(uri.path()).unwrap_or_else(|| {
+    // Asset-looking paths must 404 instead of falling back to
+    // index.html — serving HTML for a missing .js/.css masks broken
+    // asset URLs as a silently blank page ("Failed to load module
+    // script" with an HTML MIME type).
+    if looks_like_asset(uri.path()) {
+      return StatusCode::NOT_FOUND.into_response();
+    }
+    embedded_asset("/index.html").unwrap_or_else(|| StatusCode::NOT_FOUND.into_response())
+  })
+}
+
+#[derive(rust_embed::RustEmbed)]
+#[folder = "../dist/"]
+struct AdminAssets;
+
+fn looks_like_asset(path: &str) -> bool {
+  const ASSET_EXTENSIONS: [&str; 12] = [
+    "js", "mjs", "css", "map", "woff", "woff2", "ttf", "otf", "svg", "png", "jpg", "ico",
+  ];
+  let name = path.rsplit('/').next().unwrap_or(path);
+  name
+    .split_once('.')
+    .is_some_and(|(_, ext)| ASSET_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
+}
+
+fn embedded_asset(path: &str) -> Option<Response> {
+  use axum::http::{HeaderValue, header};
+  let key = path.trim_start_matches('/');
+  let key = if key.is_empty() { "index.html" } else { key };
+  let asset = AdminAssets::get(key)?;
+  let mime = mime_guess::from_path(key).first_or_octet_stream();
+  let mut response = asset.data.into_owned().into_response();
+  response.headers_mut().insert(
+    header::CONTENT_TYPE,
+    HeaderValue::from_str(mime.as_ref()).ok()?,
+  );
+  let cache = if key == "index.html" {
+    "no-cache"
+  } else {
+    "public, max-age=31536000, immutable"
+  };
+  response
+    .headers_mut()
+    .insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
+  Some(response)
+}

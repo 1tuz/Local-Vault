@@ -1,0 +1,146 @@
+---
+title: "Identity and tokens"
+description: "Root, admin, member, and AI-agent access, human sessions, and environment-scoped runner tokens."
+---
+
+# Identity and tokens
+
+Dopbase needs identities for people and for software.
+
+## Human users
+
+The instance has one protected human `root` account, created during first-run
+setup, plus `admin` and `member` accounts. All three human roles have full
+project, environment, secret, and runner-token access in the Admin UI and
+existing human CLI operations. Root and admin manage human and AI accounts.
+Root alone manages full-instance backups and factory reset. Other users cannot change or delete the root account.
+
+Passwords are hashed with Argon2id. Browser sessions have an eight-hour idle
+and 24-hour absolute lifetime. CLI sessions are opaque bearer tokens with a
+30-day idle and 90-day absolute lifetime and are stored in an encrypted local
+session file. Offline password recovery verifies the master key, requires
+the server to be stopped, and revokes every human session.
+
+## Machine identities
+
+CI jobs, servers, containers, deployment systems, and automation use
+environment-scoped runner tokens.
+
+```bash
+dopbase login --token
+dopbase run env_482731 -- npm start
+```
+
+The prompt does not echo the token. A provisioning script can pipe it instead:
+
+```bash
+printf '%s' "$RUNNER_TOKEN" | dopbase login --token
+```
+
+CI and deployment platforms should inject `DOPBASE_TOKEN` from their secret
+store. Authentication uses `DOPBASE_TOKEN`, then the encrypted saved credential.
+An invalid environment credential stops the command; Dopbase does not fall back
+to a saved credential.
+
+`dopbase login` and `dopbase login --token` encrypt their credential in the
+extensionless `session` file under the Dopbase data directory. The separate
+`session-key` file holds the random local encryption key. The global TOML
+config contains the selected server but never the token. A saved credential is
+used only for its matching server. Saving another credential replaces it.
+
+The encrypted payload also caches the administrator email for offline
+`dopbase client status` output. The password is never stored.
+
+Human `secret get --reveal` and `export` operations in the official CLI require
+interactive password confirmation every time. Runner tokens can export their
+assigned environment without a prompt, using `DOPBASE_TOKEN` or a saved runner
+credential. Direct HTTP clients follow the server's authentication policy;
+browser exports require recent password authentication and a valid CSRF header.
+
+For application servers, create a runner token scoped to one environment:
+
+```bash
+dopbase token create payment-service/production \
+  --name production-server --role runner
+```
+
+The plaintext token is displayed only once. A runner can retrieve, inject, and
+export values from its assigned environment. It cannot change secrets or access
+another environment. Exports are audited with the runner token ID and secret
+count, without recording values. Production and staging servers should always
+use different runner tokens. Runner tokens have no expiry by default. Use
+`--expires-in 12h` or `--expires-in 7d` when creating one for a short job.
+Durations must be whole hours or days, up to 1,095 days.
+
+## AI agents
+
+The `ai_agent` role belongs to named service accounts with bearer tokens,
+not email/password sessions. Each token is either global (metadata only) or
+limited to one project. A project token can add and version data in that
+project, but cannot delete, reveal, export, manage accounts, list runner tokens,
+or read audit history. `dopbase run` passes secret values to the child process;
+the same token can call the runtime endpoint directly, so it must be trusted
+with those values.
+
+Agent tokens are displayed only once when created. They expire after 30 days
+by default. The Admin UI also offers no expiry and custom durations of up to
+three years. Revoking a token or deleting its account prevents subsequent access.
+Pass an agent token to the CLI through `DOPBASE_TOKEN`, just like a runner
+token. `dopbase client status` identifies its scope without displaying the
+token. See [AI agent access](/guide/ai-agent-access) for a practical workflow
+and [users and AI agents](/ui/users) for account management.
+
+## Permission model
+
+Human roles are static and share all projects. AI-agent token scope is chosen
+when issuing each token. Runner tokens remain a separate environment-scoped
+credential type.
+
+| Operation                                                                  | Root | Admin | Member | AI agent |
+| -------------------------------------------------------------------------- | ---- | ----- | ------ | -------- |
+| Read project/environment and secret metadata                               | Yes  | Yes   | Yes    | Yes      |
+| Manage projects, environments, secrets, imports/exports, and runner tokens | Yes  | Yes   | Yes    | No       |
+| Manage non-root human users and AI accounts                                | Yes  | Yes   | No     | No       |
+| Read audit events, including filtered history                              | Yes  | Yes   | No     | No       |
+| View instance status                                                       | Yes  | Yes   | Yes    | Yes      |
+| Full-instance backups and master-key download                              | Yes  | No    | No     | No       |
+| Factory reset in the Admin UI or offline host CLI                          | Yes  | No    | No     | No       |
+
+No human can delete their own account or change their own role. An admin can
+manage another admin, but cannot modify root. Root is created only during first-run setup. Root changes its password through Account settings.
+After an account is updated, that user needs to sign in again.
+
+These roles are available in version {{version}}. See [product status](/guide/product-status)
+for the current operational boundaries.
+
+Full-instance backup listing, creation, upload, download, restore, and deletion
+are root-only because snapshots contain every project and human account.
+
+## Factory reset
+
+The root-only factory reset deletes every account (including root), all
+projects, environments, secrets, runner tokens, AI accounts and their tokens,
+audit history, and server-held backups. It preserves deployment configuration
+and the master key, then reopens first-run setup. The Admin UI requires the
+root password, an explicit acknowledgment, and `FACTORY RESET`. The offline
+`dopbase admin factory-reset` command requires the server to be stopped, the
+root password, and `please-wipe-out-system`. It saves the whole data directory
+as a timestamped ZIP before removing it. Pass `--no-backup` to remove the data
+without creating the ZIP. The next `server start` enters automatic setup on
+fresh storage. For backup restore, omit `DOPBASE_ROOT_EMAIL` during startup or
+use `server setup --web`. Pending resets still require explicit setup.
+See
+[factory reset](/self-hosting/factory-reset) for the confirmation steps and deletion scope.
+
+## Token handling
+
+Tokens must be scoped, revocable, and hidden from logs. Operators should use the narrowest permissions available and rotate a token immediately if it may have been exposed.
+
+`dopbase run` removes `DOPBASE_TOKEN` before starting the child process. Use a
+saved runner credential on a persistent server, or let your deployment platform
+inject `DOPBASE_TOKEN`. Environment variables still need protection from logs
+and processes that can inspect the runner.
+
+The session and key files are restricted to the current user where the platform
+supports it. An attacker that can read both files can decrypt the token. Use
+`DOPBASE_TOKEN` when an externally managed credential is required.

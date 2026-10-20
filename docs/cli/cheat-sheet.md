@@ -1,0 +1,113 @@
+---
+title: "CLI cheat sheet"
+description: "Every Dopbase CLI command and option, with short examples."
+pageClass: cli-cheat-sheet
+---
+
+# CLI cheat sheet
+
+`<PROJECT_REF>` means a project ID or name. `<ENVIRONMENT_REF>` means an
+environment ID or `<PROJECT_REF>/<ENVIRONMENT_NAME>`.
+
+## Global options
+
+Global options work with commands throughout the CLI. A command may reject an
+option when it does not apply, such as `--server` with a local server command.
+
+| Option                  | What it does                                                                        | Example                                                     |
+| ----------------------- | ----------------------------------------------------------------------------------- | ----------------------------------------------------------- |
+| `--server <URL>`        | Use this server for one client command instead of the saved server or `DOPBASE_URL` | `dopbase --server https://dopbase.example.com project list` |
+| `--data-dir <DIR>`      | Use another directory for Dopbase state and configuration                           | `dopbase --data-dir /srv/dopbase server status`             |
+| `--json`                | Print machine-readable JSON where the command supports it                           | `dopbase --json project list`                               |
+| `-h`, `--help`          | Show help for the current command                                                   | `dopbase secret set --help`                                 |
+| `-v`, `-V`, `--version` | Show the installed Dopbase version                                                  | `dopbase -v`                                                |
+
+The built-in help command accepts the same command path. For example,
+`dopbase help secret set` shows the usage, argument descriptions, options, and
+examples for `secret set`.
+
+## Server and connection
+
+| Task                               | Command                               | Command options                                                                                                                                                                   | Example                                                |
+| ---------------------------------- | ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------ |
+| Initialize a local instance        | `dopbase server setup`                | `--email <EMAIL>`, `--web`, `--config <FILE>`, `--master-key-file <FILE>`; listener options require `--web`                                                                       | `dopbase server setup --email admin@example.com`       |
+| Run the server in this terminal    | `dopbase server start`                | `--config <FILE>`, `--host <HOST>`, `--port <PORT>`, `--public-url <URL>`, `--shutdown-grace-seconds <SECONDS>`, `--docs`, `--no-docs`, `--no-web-ui`, `--master-key-file <FILE>` | `dopbase server start --port 9000`                     |
+| Start the server in the background | `dopbase server start --background`   | Same options as `server start`; `-b` is shorthand for `--background`                                                                                                              | `dopbase server start --background --docs`             |
+| Restart the background server      | `dopbase server restart`              | `--timeout <SECONDS>` (default: `10`)                                                                                                                                             | `dopbase server restart --timeout 30`                  |
+| Stop the background server         | `dopbase server stop`                 | `--timeout <SECONDS>` (default: `10`)                                                                                                                                             | `dopbase server stop --timeout 30`                     |
+| Check the local server process     | `dopbase server status`               | No command-specific options                                                                                                                                                       | `dopbase server status`                                |
+| Read background logs               | `dopbase server logs`                 | `--lines <COUNT>` (default: `100`), `-w`, `--watch`, `--clean`                                                                                                                    | `dopbase server logs --clean --watch`                  |
+| Select another server              | `dopbase client connect <SERVER_URL>` | No command-specific options                                                                                                                                                       | `dopbase client connect https://dopbase.example.com`   |
+| Return to the local server         | `dopbase client connect local`        | No command-specific options                                                                                                                                                       | `dopbase client connect local`                         |
+| Check connection and login         | `dopbase client status`               | No command-specific options                                                                                                                                                       | `dopbase client status`                                |
+| Check connection and login (alias) | `dopbase status`                      | No command-specific options                                                                                                                                                       | `dopbase status`                                       |
+| Sign in                            | `dopbase login`                       | `--token` saves a runner token from a masked prompt or piped standard input                                                                                                       | `printf '%s' "$RUNNER_TOKEN" \| dopbase login --token` |
+| Sign out                           | `dopbase logout`                      | No command-specific options                                                                                                                                                       | `dopbase logout`                                       |
+
+Fresh `server start` uses web setup by default. `DOPBASE_ROOT_EMAIL` instead
+creates root with a generated password shown once; initialized startup ignores
+it. Explicit CLI setup remains optional: `--email` generates a password and
+supports `--json`; `--web` runs browser setup and only prefills a supplied email.
+With a disabled web UI, supply a root email or complete CLI setup first. Pending
+factory resets require explicit setup.
+See [server setup](./setup).
+
+`--host` defaults to `127.0.0.1` and `--port` defaults to `8840`. When
+`--host` exposes the server beyond loopback, also set `--public-url`.
+
+## Projects and environments
+
+| Task                                   | Command                                                                          | Command options                                                                                    | Example                                              |
+| -------------------------------------- | -------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- | ---------------------------------------------------- |
+| Create a project and first environment | `dopbase init [PROJECT_NAME/ENVIRONMENT_NAME]`                                   | No arguments scans `./.env`; the explicit form requires `--from <FILE\|->` and supports `--format` | `dopbase init`                                       |
+| Create a project                       | `dopbase project create <PROJECT_NAME>`                                          | No command-specific options                                                                        | `dopbase project create payment-service`             |
+| List projects                          | `dopbase project list`                                                           | No command-specific options                                                                        | `dopbase project list`                               |
+| Show a project                         | `dopbase project show <PROJECT_REF>`                                             | No command-specific options                                                                        | `dopbase project show payment-service`               |
+| Rename a project                       | `dopbase project rename <PROJECT_REF> <NEW_PROJECT_NAME>`                        | No command-specific options                                                                        | `dopbase project rename payment-service payments`    |
+| Delete a project                       | `dopbase project delete <PROJECT_REF>`                                           | `--yes` skips confirmation                                                                         | `dopbase project delete payment-service --yes`       |
+| Create an environment                  | `dopbase env create <PROJECT_REF/ENVIRONMENT_NAME>`                              | No command-specific options                                                                        | `dopbase env create payment-service/production`      |
+| Clone an environment                   | `dopbase env clone <PROJECT_REF/SOURCE_ENVIRONMENT_NAME> <NEW_ENVIRONMENT_NAME>` | `--yes` skips clone confirmation but not recent authentication                                     | `dopbase env clone payment-service/local production` |
+| List environments                      | `dopbase env list [PROJECT_REF]`                                                 | No command-specific options                                                                        | `dopbase env list payment-service`                   |
+| Show an environment                    | `dopbase env show <ENVIRONMENT_REF>`                                             | No command-specific options                                                                        | `dopbase env show payment-service/production`        |
+| Set the run default                    | `dopbase env default <ENVIRONMENT_REF>`                                          | No command-specific options                                                                        | `dopbase env default payment-service/development`    |
+| Clear the run default                  | `dopbase env default --clear`                                                    | `--clear`                                                                                          | `dopbase env default --clear`                        |
+| Rename an environment                  | `dopbase env rename <ENVIRONMENT_REF> <NEW_ENVIRONMENT_NAME>`                    | No command-specific options                                                                        | `dopbase env rename payment-service/production prod` |
+| Delete an environment                  | `dopbase env delete <ENVIRONMENT_REF>`                                           | `--yes` skips confirmation                                                                         | `dopbase env delete payment-service/staging --yes`   |
+
+## Secrets and application commands
+
+| Task                      | Command                                                        | Command options                                                                                                                             | Example                                                                                                      |
+| ------------------------- | -------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| Edit all secrets          | `dopbase env edit <ENVIRONMENT_REF>`                           | `--editor` selects an editor; `--dry-run` previews without saving. Requires a terminal and password confirmation                            | `dopbase env edit payment-service/staging --editor hx`                                                       |
+| List secret keys          | `dopbase secret list <ENVIRONMENT_REF>`                        | No command-specific options                                                                                                                 | `dopbase secret list payment-service/production`                                                             |
+| Set a secret              | `dopbase secret set <ENVIRONMENT_REF> <KEY>`                   | `--stdin` reads the value from standard input                                                                                               | `printf '%s' "$API_KEY" \| dopbase secret set payment-service/production API_KEY --stdin`                    |
+| Show secret metadata      | `dopbase secret get <ENVIRONMENT_REF> <KEY>`                   | No command-specific options                                                                                                                 | `dopbase secret get payment-service/production API_KEY`                                                      |
+| Reveal a secret           | `dopbase secret get <ENVIRONMENT_REF> <KEY>`                   | `--reveal` prints the value after password confirmation                                                                                     | `dopbase secret get payment-service/production API_KEY --reveal`                                             |
+| List secret versions      | `dopbase secret versions <ENVIRONMENT_REF> <KEY>`              | Metadata only; values are never returned                                                                                                    | `dopbase secret versions payment-service/production API_KEY`                                                 |
+| Roll back a secret        | `dopbase secret rollback <ENVIRONMENT_REF> <KEY> <VERSION>`    | Creates a new current version; `--yes` skips confirmation                                                                                   | `dopbase secret rollback payment-service/production API_KEY 2`                                               |
+| Delete a secret           | `dopbase secret delete <ENVIRONMENT_REF> <KEY>`                | `--yes` skips confirmation                                                                                                                  | `dopbase secret delete payment-service/production API_KEY --yes`                                             |
+| Browse project files      | `dopbase files <PROJECT_REF> tree`                             | Lists folder and file IDs without values                                                                                                    | `dopbase files payment-service tree`                                                                         |
+| Create encrypted file     | `dopbase files <PROJECT_REF> file create <FOLDER_PATH> <NAME>` | `--kind` and exactly one of `--input` or `--stdin`                                                                                          | `dopbase files payment-service file create production/cluster kubeconfig --kind kubeconfig --input ./config` |
+| Import a secret file      | `dopbase import <ENVIRONMENT_REF> <FILE\|->`                   | Supports dotenv, JSON, YAML, and TOML. `--format` is required for stdin. `--dry-run`, `--replace`, and `--yes` keep their existing behavior | `dopbase import payment-service/staging secrets.toml --dry-run`                                              |
+| Export to a file          | `dopbase export <ENVIRONMENT_REF> --output <FILE>`             | Runner tokens export their assigned environment without a prompt. `--format` overrides inference; `--force` overwrites an existing file     | `dopbase export payment-service/staging --output secrets.yml --force`                                        |
+| Export to standard output | `dopbase export <ENVIRONMENT_REF> --stdout`                    | Defaults to dotenv. Use `--format json`, `--format yaml`, `--format toml`, or export-only `--format docker` for another serialization       | `dopbase export payment-service/staging --stdout --format toml`                                              |
+| Run with injected secrets | `dopbase run [ENVIRONMENT_REF] -- <COMMAND>`                   | `DOPBASE_TOKEN` takes priority over the saved credential. Everything after `--` is the child command                                        | `dopbase run payment-service/development -- npm start`                                                       |
+
+## Tokens, backups, and maintenance
+
+| Task                             | Command                                                | Command options                                                                                                                                                                         | Example                                                                             |
+| -------------------------------- | ------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| Create a runner token            | `dopbase token create <ENVIRONMENT_REF> --name <NAME>` | `--name <NAME>` is required. `--role <ROLE>` defaults to `runner`. `--expires-in <DURATION>` accepts `never`, hours, or days up to three years.                                         | `dopbase token create payment-service/production --name deploy --expires-in 12h`    |
+| List runner tokens               | `dopbase token list <ENVIRONMENT_REF>`                 | No command-specific options                                                                                                                                                             | `dopbase token list payment-service/production`                                     |
+| Revoke a token                   | `dopbase token revoke <TOKEN_ID>`                      | No command-specific options                                                                                                                                                             | `dopbase token revoke tok_01ABCDEF`                                                 |
+| Create a backup                  | `dopbase backup [NAME]`                                | `-o <FILE>`, `--output <FILE>` downloads a local copy                                                                                                                                   | `dopbase backup pre-upgrade --output backup.dop`                                    |
+| Restore a backup                 | `dopbase restore <FILE>`                               | `-k <KEY>`, `--key <KEY>` supplies the source master key. `--setup-token <TOKEN>` is required for first-run restore through automatic or explicit web setup. `--yes` skips confirmation | `dopbase restore backup.dop --key ./master.key --yes`                               |
+| List runtime cache metadata      | `dopbase cache list`                                   | Global `--json` prints machine-readable output                                                                                                                                          | `dopbase cache list --json`                                                         |
+| Clean old runtime cache entries  | `dopbase cache clean`                                  | Defaults to entries older than `14d`. Supports `--older-than <AGE>`, `--all`, `--dry-run`, and `--yes`                                                                                  | `dopbase cache clean --older-than 30d --yes`                                        |
+| Reset an admin password offline  | `dopbase admin reset-password <EMAIL>`                 | `--config <FILE>`, `--master-key-file <FILE>`                                                                                                                                           | `dopbase admin reset-password admin@example.com --config /srv/dopbase/server.toml`  |
+| Reset the local instance offline | `dopbase admin factory-reset`                          | `--config <FILE>`, `--no-backup`                                                                                                                                                        | `dopbase --data-dir /srv/dopbase admin factory-reset`                               |
+| Check for a new release          | `dopbase update`                                       | No command-specific options                                                                                                                                                             | `dopbase update`                                                                    |
+| Migrate Local Vault              | `dopbase migrate local-vault`                          | `--folder <NAME>` required; `--backup <PATH>` required for import; `--dry-run` previews. Old password is prompted securely.                                                             | `dopbase migrate local-vault --folder Imported --backup ~/local-vault-backup.vault` |
+
+Run `dopbase help <command>` or `dopbase help <command> <subcommand>` for the
+same option descriptions in the terminal.

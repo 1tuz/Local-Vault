@@ -1,0 +1,96 @@
+[package]
+name = "app"
+version = "0.1.9"
+edition = "2024"
+license = "Apache-2.0"
+
+[[bin]]
+name = "dopbase"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime (required by axum / sqlx)
+tokio = { version = "1", features = [
+  "macros",
+  "rt-multi-thread",
+  "signal",
+  "net",
+  "process",
+  "io-util",
+  "io-std",
+] }
+# HTTP server / REST API
+axum = { version = "0.8", default-features = false, features = [
+  "http1",
+  "json",
+  "matched-path",
+  "multipart",
+  "query",
+  "tokio",
+  "tracing",
+] }
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
+tower-http = { version = "0.7", features = ["request-id", "timeout", "trace"] }
+# API Documentation
+utoipa = { version = "5", features = ["axum_extras"] }
+utoipa-swagger-ui = { version = "9", features = ["axum"] }
+# SQLite driver, connection pool, and runtime migrations
+sqlx = { version = "0.8", default-features = false, features = [
+  "sqlite",
+  "runtime-tokio",
+  "migrate",
+  "macros",
+  "json",
+] }
+# CLI subcommands (serve, login, run, ...)
+clap = { version = "4", features = ["derive"] }
+anstream = "1"
+anstyle = "1"
+inquire = "0.9"
+# Serialization for the REST API
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde-saphyr = "1.2"
+toml = "0.9"
+url = "2"
+# Authentication tokens
+reqwest = { version = "0.12", default-features = false, features = [
+  "json",
+  "rustls-tls",
+  "rustls-tls-native-roots",
+  "multipart",
+] }
+# Envelope encryption (authenticated encryption)
+chacha20poly1305 = "0.10"
+aes-gcm = "0.10"
+# Human-user authentication (password hashing)
+argon2 = "0.5"
+# Timestamps (audit records, token metadata)
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1"
+base64 = "0.22"
+hex = "0.4"
+getrandom = "0.3"
+hkdf = "0.12"
+mime_guess = "2"
+regex = "1"
+rust-embed = "8"
+sha2 = "0.10"
+rusqlite = { version = "0.32", features = ["bundled", "serialize"] }
+subtle = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ulid = { version = "1", features = ["serde"] }
+zeroize = "1"
+shlex = "2"
+tempfile = "3"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.30", features = ["signal", "process", "fs"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+nix = { version = "0.30", features = ["term"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+

@@ -1,0 +1,315 @@
+use clap::{ArgAction, Parser, Subcommand, error::ErrorKind};
+use std::{
+  ffi::{OsStr, OsString},
+  io::{self, Write},
+  path::PathBuf,
+};
+
+use crate::{
+  cli::commands::{
+    admin, auth, backup, cache, client, environment, export, import, init, mcp, migrate, project,
+    restore, run, secret, server, token, update, vault,
+  },
+  constants::help::*,
+};
+
+pub use admin::AdminCommand;
+pub use auth::LoginArgs;
+pub use backup::BackupArgs;
+pub use cache::CacheCommand;
+pub use client::ClientCommand;
+pub use environment::EnvCommand;
+pub use export::ExportArgs;
+pub use import::ImportArgs;
+pub use init::InitArgs;
+pub use mcp::McpCommand;
+pub use migrate::MigrateCommand;
+pub use project::ProjectCommand;
+pub use restore::RestoreArgs;
+pub use run::RunArgs;
+pub use secret::SecretCommand;
+pub use server::{ServerCommand, ServerLaunchArgs, ServerSetupArgs, ServerStartArgs};
+pub use token::TokenCommand;
+pub use vault::VaultCommand;
+
+#[derive(Parser, Debug)]
+#[command(
+  name = "dopbase",
+  version,
+  disable_version_flag = true,
+  about = "Secrets management in one binary",
+  long_about = "Dopbase keeps application secrets in one binary: run a server, store \
+secrets per project and environment, and inject them into any command with `run`.",
+  after_help = AFTER_HELP
+)]
+pub struct Cli {
+  /// Print the installed Dopbase version.
+  #[arg(
+    short = 'v',
+    visible_short_alias = 'V',
+    long = "version",
+    action = ArgAction::Version
+  )]
+  version: Option<bool>,
+  /// Client endpoint for this invocation, overriding the saved server and
+  /// DOPBASE_URL. This does not apply to local server commands.
+  #[arg(long, global = true, value_name = "URL")]
+  pub server: Option<String>,
+  /// Directory for Dopbase state and configuration.
+  #[arg(long, global = true, value_name = "DIR")]
+  pub data_dir: Option<PathBuf>,
+  /// Print machine-readable JSON instead of human-readable output, where supported.
+  #[arg(long, global = true)]
+  pub json: bool,
+  #[command(subcommand)]
+  pub command: Command,
+}
+
+impl Cli {
+  /// Parse CLI arguments, showing the active command's help when required
+  /// input is missing.
+  pub fn try_parse_with_help_from<I, T>(arguments: I) -> Result<Self, clap::Error>
+  where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString>,
+  {
+    let mut arguments = arguments.into_iter().map(Into::into).collect::<Vec<_>>();
+    match Self::try_parse_from(arguments.clone()) {
+      Err(error)
+        if matches!(
+          error.kind(),
+          ErrorKind::MissingRequiredArgument | ErrorKind::MissingSubcommand
+        ) =>
+      {
+        let help_position = arguments
+          .iter()
+          .position(|argument| argument == OsStr::new("--"))
+          .unwrap_or(arguments.len());
+        arguments.insert(help_position, OsString::from("--help"));
+        Self::try_parse_from(arguments)
+      }
+      result => result,
+    }
+  }
+
+  pub fn parse_with_help() -> Self {
+    let arguments = std::env::args_os().collect::<Vec<_>>();
+    match Self::try_parse_from(arguments.clone()) {
+      Ok(cli) => cli,
+      Err(error) if error.kind() == ErrorKind::DisplayVersion => Self::exit_with_version(),
+      Err(error)
+        if matches!(
+          error.kind(),
+          ErrorKind::MissingRequiredArgument | ErrorKind::MissingSubcommand
+        ) =>
+      {
+        let exit_code = error.exit_code();
+        let help = Self::try_parse_with_help_from(arguments).unwrap_err();
+        help
+          .print()
+          .unwrap_or_else(|write_error| clap::Error::raw(ErrorKind::Io, write_error).exit());
+        std::process::exit(exit_code)
+      }
+      Err(error) => error.exit(),
+    }
+  }
+
+  fn exit_with_version() -> ! {
+    let mut stdout = io::stdout().lock();
+    if let Err(write_error) = writeln!(stdout, "v{}", env!("CARGO_PKG_VERSION")) {
+      clap::Error::raw(ErrorKind::Io, write_error).exit();
+    }
+    drop(stdout);
+    std::process::exit(0)
+  }
+}
+
+#[derive(Subcommand, Debug)]
+pub enum Command {
+  /// Set up, start, stop, inspect, and read logs from a local Dopbase server.
+  #[command(after_help = server::HELP)]
+  Server {
+    #[command(subcommand)]
+    command: ServerCommand,
+  },
+  /// Connect the CLI to a Dopbase server (`client connect <url>`).
+  ///
+  /// Without a saved server, client commands use http://localhost:8840.
+  #[command(after_help = client::HELP)]
+  Client {
+    #[command(subcommand)]
+    command: ClientCommand,
+  },
+  /// Authenticate with the active server.
+  #[command(after_help = auth::LOGIN_HELP)]
+  Login(LoginArgs),
+  /// Remove the saved credential for the active server.
+  #[command(after_help = auth::LOGOUT_HELP)]
+  Logout,
+  /// Alias for `dopbase client status`.
+  #[command(after_help = client::STATUS_ALIAS_HELP)]
+  Status,
+  /// Create a project, its first environment, and import secrets.
+  #[command(after_help = init::HELP)]
+  Init(InitArgs),
+  /// Manage projects (create, list, show, rename, delete).
+  #[command(after_help = project::HELP)]
+  Project {
+    #[command(subcommand)]
+    command: ProjectCommand,
+  },
+  /// Manage environments inside a project (create, clone, edit, list, rename, delete).
+  #[command(after_help = environment::HELP)]
+  Env {
+    #[command(subcommand)]
+    command: EnvCommand,
+  },
+  /// Manage secrets in an environment (list, set, get, delete).
+  #[command(after_help = secret::HELP)]
+  Secret {
+    #[command(subcommand)]
+    command: SecretCommand,
+  },
+  /// Manage folders and encrypted typed files inside one project.
+  #[command(name = "files", visible_alias = "vault", after_help = vault::HELP)]
+  Files {
+    /// Project name or ID that owns these files.
+    #[arg(value_name = "PROJECT_REF")]
+    project: String,
+    #[command(subcommand)]
+    command: VaultCommand,
+  },
+  /// Bulk-import secrets into an environment from a dotenv, JSON, YAML, or TOML source.
+  ///
+  /// Existing keys are kept unless --replace is passed. Use --dry-run to
+  /// preview the result without changing anything.
+  #[command(after_help = import::HELP)]
+  Import(ImportArgs),
+  /// Export secrets as dotenv, JSON, YAML, TOML, or a Docker env file.
+  ///
+  /// Requires --output <FILE> or --stdout. --force overwrites an existing
+  /// file. Every export requires interactive password confirmation.
+  #[command(after_help = export::HELP)]
+  Export(ExportArgs),
+  /// Manage CI/runner access tokens for an environment.
+  #[command(after_help = token::HELP)]
+  Token {
+    #[command(subcommand)]
+    command: TokenCommand,
+  },
+  /// Run a command with an environment's secrets injected as env vars.
+  ///
+  /// Falls back to DOPBASE_ENV, then the active server's saved default, when
+  /// no environment argument is given. Secret values are passed to the child
+  /// process only and are never printed. A successful fetch refreshes an
+  /// encrypted local cache. If the server is unavailable, the last cache for
+  /// the same server, environment, and credential is used. Everything after
+  /// `--` is the command to run.
+  #[command(after_help = run::HELP)]
+  Run(RunArgs),
+  /// Inspect and clean the encrypted runtime cache for the active server.
+  #[command(after_help = cache::HELP)]
+  Cache {
+    #[command(subcommand)]
+    command: CacheCommand,
+  },
+  /// Offline server administration.
+  #[command(after_help = admin::HELP)]
+  Admin {
+    #[command(subcommand)]
+    command: AdminCommand,
+  },
+  /// Check GitHub for a newer Dopbase release (informational only).
+  #[command(after_help = update::HELP)]
+  Update,
+  /// Expose metadata-only Dopbase tools over the MCP stdio transport.
+  #[command(after_help = mcp::HELP)]
+  Mcp {
+    #[command(subcommand)]
+    command: McpCommand,
+  },
+  /// Migrate data from a preserved Local Vault file into encrypted Dopbase storage.
+  #[command(after_help = migrate::HELP)]
+  Migrate {
+    #[command(subcommand)]
+    command: MigrateCommand,
+  },
+  /// Create an encrypted backup snapshot of the Dopbase instance.
+  ///
+  /// Backs up projects, environments, secrets, runner tokens, and admin
+  /// accounts into an XChaCha20-Poly1305 encrypted .dop archive. Without [name],
+  /// a timestamped name is generated automatically. Stored on the server by
+  /// default. Specify -o/--output to also download and save locally.
+  #[command(after_help = backup::HELP)]
+  Backup(BackupArgs),
+  /// Restore the instance from an encrypted .dop backup file.
+  ///
+  /// Restores all projects, environments, secrets, runner tokens, and admin
+  /// accounts from the specified backup. If the server is uninitialized,
+  /// completes bootstrap restoration. If already initialized, requires
+  /// confirmation and administrator credentials.
+  #[command(after_help = restore::HELP)]
+  Restore(RestoreArgs),
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{Cli, Command};
+  use clap::Parser;
+
+  #[test]
+  fn parses_secret_rollback_and_typed_vault_file_commands() {
+    let rollback = Cli::try_parse_from([
+      "dopbase",
+      "secret",
+      "rollback",
+      "env_123",
+      "DATABASE_URL",
+      "2",
+      "--yes",
+    ])
+    .unwrap();
+    assert!(matches!(rollback.command, Command::Secret { .. }));
+
+    let create = Cli::try_parse_from([
+      "dopbase",
+      "files",
+      "payments",
+      "file",
+      "create",
+      "production/cluster",
+      "kubeconfig",
+      "--kind",
+      "kubeconfig",
+      "--input",
+      "config.yaml",
+    ])
+    .unwrap();
+    assert!(matches!(create.command, Command::Files { .. }));
+
+    let file_environment = Cli::try_parse_from([
+      "dopbase",
+      "files",
+      "payments",
+      "file",
+      "set-environment",
+      "production/cluster/kubeconfig",
+      "--environment",
+      "production",
+    ])
+    .unwrap();
+    assert!(matches!(file_environment.command, Command::Files { .. }));
+
+    let folder_environment = Cli::try_parse_from([
+      "dopbase",
+      "files",
+      "payments",
+      "folder",
+      "set-environment",
+      "production/cluster",
+      "--clear",
+    ])
+    .unwrap();
+    assert!(matches!(folder_environment.command, Command::Files { .. }));
+  }
+}

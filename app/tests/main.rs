@@ -1,0 +1,1442 @@
+use app::{config::ServerConfig, server};
+use axum::{
+  Router,
+  body::{Body, to_bytes},
+  http::{Request, header},
+};
+use serde_json::{Value, json};
+use tempfile::TempDir;
+use tokio::sync::Barrier;
+use tower::ServiceExt;
+
+async fn test_app() -> (TempDir, app::state::AppState, Router) {
+  let (directory, state, router) = test_app_with_docs(true).await;
+  (directory, state, router)
+}
+
+async fn test_app_with_docs(docs_enabled: bool) -> (TempDir, app::state::AppState, Router) {
+  test_app_with_ui(docs_enabled, true).await
+}
+
+async fn test_app_with_ui(
+  docs_enabled: bool,
+  web_ui_enabled: bool,
+) -> (TempDir, app::state::AppState, Router) {
+  let directory = TempDir::new().unwrap();
+  let database = directory.path().join("dopbase.db");
+  let config = ServerConfig {
+    data_dir: directory.path().to_path_buf(),
+    database_url: format!("sqlite://{}", database.display()),
+    master_key: app::config::MasterKeyConfig {
+      provider: "file".into(),
+      path: directory.path().join("master.key"),
+    },
+    docs_enabled,
+    web_ui_enabled,
+    ..ServerConfig::default()
+  };
+  let state = server::build_setup_state(config).await.unwrap();
+  let router = server::router(state.clone());
+  (directory, state, router)
+}
+
+async fn call(
+  router: &Router,
+  method: &str,
+  path: &str,
+  token: Option<&str>,
+  body: Option<Value>,
+) -> (u16, Value, axum::http::HeaderMap) {
+  let mut builder = Request::builder().method(method).uri(path);
+  if let Some(token) = token {
+    builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+  }
+  if body.is_some() {
+    builder = builder.header(header::CONTENT_TYPE, "application/json");
+  }
+  let request = builder
+    .body(body.map_or_else(Body::empty, |value| Body::from(value.to_string())))
+    .unwrap();
+  let response = router.clone().oneshot(request).await.unwrap();
+  let status = response.status().as_u16();
+  let headers = response.headers().clone();
+  let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+  let json = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+  (status, json, headers)
+}
+
+async fn get(
+  router: &Router,
+  path: &str,
+) -> axum::response::Response {
+  let request = Request::builder().uri(path).body(Body::empty()).unwrap();
+  router.clone().oneshot(request).await.unwrap()
+}
+
+async fn admin_environment() -> (TempDir, app::state::AppState, Router, String, String) {
+  let (directory, state, router) = test_app().await;
+  let setup = state.setup.read().await.token.clone().unwrap();
+  let (status, _, _) = call(
+    &router,
+    "POST",
+    "/api/v1/bootstrap/admin",
+    None,
+    Some(json!({"setupToken":setup,"email":"admin@example.com","password":"correct-horse-123"})),
+  )
+  .await;
+  assert_eq!(status, 201);
+  let (_, login, _) = call(
+    &router,
+    "POST",
+    "/api/v1/auth/login",
+    None,
+    Some(json!({"email":"admin@example.com","password":"correct-horse-123","sessionKind":"cli"})),
+  )
+  .await;
+  let token = login["data"]["token"].as_str().unwrap().to_owned();
+  let (status, _, _) = call(
+    &router,
+    "POST",
+    "/api/v1/projects",
+    Some(&token),
+    Some(json!({"name":"concurrency-test"})),
+  )
+  .await;
+  assert_eq!(status, 201);
+  let (status, environment, _) = call(
+    &router,
+    "POST",
+    "/api/v1/projects/concurrency-test/environments",
+    Some(&token),
+    Some(json!({"name":"production"})),
+  )
+  .await;
+  assert_eq!(status, 201);
+  let environment_id = environment["data"]["id"].as_str().unwrap().to_owned();
+  (directory, state, router, token, environment_id)
+}
+
+async fn bootstrap_admin(
+  state: &app::state::AppState,
+  router: &Router,
+) -> String {
+  let setup = state.setup.read().await.token.clone().unwrap();
+  let (status, _, _) = call(
+    router,
+    "POST",
+    "/api/v1/bootstrap/admin",
+    None,
+    Some(json!({"setupToken":setup,"email":"admin@example.com","password":"correct-horse-123"})),
+  )
+  .await;
+  assert_eq!(status, 201);
+  let (status, login, _) = call(
+    router,
+    "POST",
+    "/api/v1/auth/login",
+    None,
+    Some(json!({"email":"admin@example.com","password":"correct-horse-123","sessionKind":"cli"})),
+  )
+  .await;
+  assert_eq!(status, 200);
+  login["data"]["token"].as_str().unwrap().to_owned()
+}
+
+fn assert_environment_id(id: &str) {
+  assert_eq!(id.len(), 10, "unexpected environment ID: {id}");
+  assert!(id.starts_with("env_"), "unexpected environment ID: {id}");
+  assert!(
+    id[4..].bytes().all(|byte| byte.is_ascii_digit()),
+    "unexpected environment ID: {id}"
+  );
+  assert_ne!(id, "env_000000");
+}
+
+#[tokio::test]
+async fn environment_references_accept_project_names_and_ids() {
+  let (_directory, state, router) = test_app().await;
+  let token = bootstrap_admin(&state, &router).await;
+  let (status, project, _) = call(
+    &router,
+    "POST",
+    "/api/v1/projects",
+    Some(&token),
+    Some(json!({"name":"payment-service"})),
+  )
+  .await;
+  assert_eq!(status, 201);
+  let project_id = project["data"]["id"].as_str().unwrap();
+
+  let (status, environment, _) = call(
+    &router,
+    "POST",
+    "/api/v1/projects/payment-service/environments",
+    Some(&token),
+    Some(json!({"name":"production"})),
+  )
+  .await;
+  assert_eq!(status, 201);
+  let environment_id = environment["data"]["id"].as_str().unwrap();
+
+  for reference in [
+    environment_id.to_owned(),
+    "payment-service/production".into(),
+    format!("{project_id}/production"),
+  ] {
+    let encoded: String = url::form_urlencoded::byte_serialize(reference.as_bytes()).collect();
+    let (status, resolved, _) = call(
+      &router,
+      "GET",
+      &format!("/api/v1/environments/resolve?reference={encoded}"),
+      Some(&token),
+      None,
+    )
+    .await;
+    assert_eq!(status, 200, "failed to resolve {reference}: {resolved}");
+    assert_eq!(resolved["data"]["id"], environment_id);
+  }
+  state.db.close().await;
+}
+
+#[tokio::test]
+async fn projects_and_environments_accept_display_names() {
+  let (_directory, state, router) = test_app().await;
+  let token = bootstrap_admin(&state, &router).await;
+  let project_name = "AppFarm — R&D / Платформа!";
+  let (status, project, _) = call(
+    &router,
+    "POST",
+    "/api/v1/projects",
+    Some(&token),
+    Some(json!({"name":project_name})),
+  )
+  .await;
+  assert_eq!(status, 201, "{project}");
+  assert_eq!(project["data"]["name"], project_name);
+  let project_id = project["data"]["id"].as_str().unwrap();
+
+  let (status, environment, _) = call(
+    &router,
+    "POST",
+    &format!("/api/v1/projects/{project_id}/environments"),
+    Some(&token),
+    Some(json!({"name":"Release Candidate 2 (EU)!"})),
+  )
+  .await;
+  assert_eq!(status, 201, "{environment}");
+  assert_eq!(environment["data"]["name"], "Release Candidate 2 (EU)!");
+
+  let (status, renamed, _) = call(
+    &router,
+    "PATCH",
+    &format!("/api/v1/projects/{project_id}"),
+    Some(&token),
+    Some(json!({"name":"AppFarm [prod]"})),
+  )
+  .await;
+  assert_eq!(status, 200, "{renamed}");
+  assert_eq!(renamed["data"]["name"], "AppFarm [prod]");
+  state.db.close().await;
+}
+
+#[tokio::test]
+async fn project_and_environment_conflicts_leave_existing_data_unchanged() {
+  let (_directory, state, router) = test_app().await;
+  let token = bootstrap_admin(&state, &router).await;
+  let (status, initialized, _) = call(
+    &router,
+    "POST",
+    "/api/v1/projects/init",
+    Some(&token),
+    Some(json!({
+      "projectName":"conflict-test",
+      "environmentName":"production",
+      "entries":[{"key":"API_KEY","value":"original"}]
+    })),
+  )
+  .await;
+  assert_eq!(status, 201);
+  let project_id = initialized["data"]["project"]["id"].as_str().unwrap();
+
+  let (status, conflict, _) = call(
+    &router,
+    "POST",
+    "/api/v1/projects/init",
+    Some(&token),
+    Some(json!({
+      "projectName":"conflict-test",
+      "environmentName":"staging",
+      "entries":[{"key":"SHOULD_NOT_EXIST","value":"private"}]
+    })),
+  )
+  .await;
+  assert_eq!(status, 409);
+  assert_eq!(
+    conflict["error"]["PROJECT_ALREADY_EXISTS"],
+    "A project with this name already exists."
+  );
+
+  let (status, conflict, _) = call(
+    &router,
+    "POST",
+    "/api/v1/projects/conflict-test/environments",
+    Some(&token),
+    Some(json!({"name":"production"})),
+  )
+  .await;
+  assert_eq!(status, 409);
+  assert_eq!(
+    conflict["error"]["ENVIRONMENT_ALREADY_EXISTS"],
+    "An environment with this name already exists in the project."
+  );
+
+  let environment_count: i64 =
+    sqlx::query_scalar("SELECT COUNT(*) FROM environments WHERE project_id=?")
+      .bind(project_id)
+      .fetch_one(state.db.pool())
+      .await
+      .unwrap();
+  let secret_count: i64 = sqlx::query_scalar(
+    "SELECT COUNT(*) FROM secrets WHERE environment_id IN (SELECT id FROM environments WHERE project_id=?)",
+  )
+  .bind(project_id)
+  .fetch_one(state.db.pool())
+  .await
+  .unwrap();
+  assert_eq!(environment_count, 1);
+  assert_eq!(secret_count, 1);
+  state.db.close().await;
+}
+
+#[tokio::test]
+async fn environment_id_creation_retries_insert_collisions() {
+  let (_directory, state, router) = test_app().await;
+  let token = bootstrap_admin(&state, &router).await;
+  let (status, _, _) = call(
+    &router,
+    "POST",
+    "/api/v1/projects",
+    Some(&token),
+    Some(json!({"name":"collisions"})),
+  )
+  .await;
+  assert_eq!(status, 201);
+
+  sqlx::query("CREATE TABLE environment_insert_attempts(count INTEGER NOT NULL)")
+    .execute(state.db.pool())
+    .await
+    .unwrap();
+  sqlx::query("INSERT INTO environment_insert_attempts(count) VALUES(0)")
+    .execute(state.db.pool())
+    .await
+    .unwrap();
+  sqlx::query(
+    "CREATE TRIGGER ignore_first_four_environment_inserts BEFORE INSERT ON environments WHEN (SELECT count FROM environment_insert_attempts)<4 BEGIN UPDATE environment_insert_attempts SET count=count+1; SELECT RAISE(IGNORE); END",
+  )
+  .execute(state.db.pool())
+  .await
+  .unwrap();
+  let (status, environment, _) = call(
+    &router,
+    "POST",
+    "/api/v1/projects/collisions/environments",
+    Some(&token),
+    Some(json!({"name":"production"})),
+  )
+  .await;
+  assert_eq!(status, 201);
+  assert_environment_id(environment["data"]["id"].as_str().unwrap());
+  let ignored_attempts: i64 = sqlx::query_scalar("SELECT count FROM environment_insert_attempts")
+    .fetch_one(state.db.pool())
+    .await
+    .unwrap();
+  assert_eq!(ignored_attempts, 4);
+  state.db.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_environment_creation_allocates_unique_random_ids() {
+  let (_directory, state, router) = test_app().await;
+  let token = bootstrap_admin(&state, &router).await;
+  let (status, _, _) = call(
+    &router,
+    "POST",
+    "/api/v1/projects",
+    Some(&token),
+    Some(json!({"name":"parallel"})),
+  )
+  .await;
+  assert_eq!(status, 201);
+
+  let barrier = std::sync::Arc::new(Barrier::new(10));
+  let mut tasks = Vec::new();
+  for number in 0..10 {
+    let router = router.clone();
+    let token = token.clone();
+    let barrier = barrier.clone();
+    tasks.push(tokio::spawn(async move {
+      barrier.wait().await;
+      call(
+        &router,
+        "POST",
+        "/api/v1/projects/parallel/environments",
+        Some(&token),
+        Some(json!({"name":format!("environment-{number}")})),
+      )
+      .await
+    }));
+  }
+
+  let mut ids = Vec::new();
+  for task in tasks {
+    let (status, body, _) = task.await.unwrap();
+    assert_eq!(status, 201, "environment create body: {body:?}");
+    ids.push(body["data"]["id"].as_str().unwrap().to_owned());
+  }
+  for id in &ids {
+    assert_environment_id(id);
+  }
+  ids.sort();
+  ids.dedup();
+  assert_eq!(ids.len(), 10);
+  state.db.close().await;
+}
+
+#[tokio::test]
+async fn repeated_environment_id_collisions_return_internal_error_and_roll_back_init() {
+  let (_directory, state, router) = test_app().await;
+  let token = bootstrap_admin(&state, &router).await;
+  sqlx::query(
+    "CREATE TRIGGER reject_environment_inserts BEFORE INSERT ON environments BEGIN SELECT RAISE(IGNORE); END",
+  )
+    .execute(state.db.pool())
+    .await
+    .unwrap();
+
+  let (status, body, _) = call(
+    &router,
+    "POST",
+    "/api/v1/projects/init",
+    Some(&token),
+    Some(json!({
+      "projectName":"rolled-back",
+      "environmentName":"production",
+      "entries":[]
+    })),
+  )
+  .await;
+  assert_eq!(status, 500);
+  assert!(body["error"]["INTERNAL_ERROR"].is_string());
+  let project_count: i64 =
+    sqlx::query_scalar("SELECT COUNT(*) FROM projects WHERE name='rolled-back'")
+      .fetch_one(state.db.pool())
+      .await
+      .unwrap();
+  assert_eq!(project_count, 0);
+  state.db.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_secret_sets_increment_every_version() {
+  let (_directory, state, router, token, environment_id) = admin_environment().await;
+  let path = format!("/api/v1/environments/{environment_id}/secrets/SHARED");
+  let barrier = std::sync::Arc::new(Barrier::new(20));
+  let mut tasks = Vec::new();
+  for value in 0..20 {
+    let router = router.clone();
+    let token = token.clone();
+    let path = path.clone();
+    let barrier = barrier.clone();
+    tasks.push(tokio::spawn(async move {
+      barrier.wait().await;
+      call(
+        &router,
+        "PUT",
+        &path,
+        Some(&token),
+        Some(json!({"value":format!("value-{value}")})),
+      )
+      .await
+      .0
+    }));
+  }
+  for task in tasks {
+    assert_eq!(task.await.unwrap(), 200);
+  }
+  let (_, listed, _) = call(
+    &router,
+    "GET",
+    &format!("/api/v1/environments/{environment_id}/secrets"),
+    Some(&token),
+    None,
+  )
+  .await;
+  assert_eq!(listed["data"][0]["version"], 20);
+  let audit_count: i64 = sqlx::query_scalar(
+    "SELECT COUNT(*) FROM audit_events WHERE action IN ('secret.created','secret.updated')",
+  )
+  .fetch_one(state.db.pool())
+  .await
+  .unwrap();
+  assert_eq!(audit_count, 20);
+  state.db.close().await;
+}
+
+#[tokio::test]
+async fn import_rejects_stale_revisions_during_preview_and_apply() {
+  let (_directory, state, router, token, environment_id) = admin_environment().await;
+  let base = format!("/api/v1/environments/{environment_id}/secrets");
+  let (_, preview, _) = call(
+    &router,
+    "POST",
+    &format!("{base}/import"),
+    Some(&token),
+    Some(json!({"mode":"replace","dryRun":true,"entries":[{"key":"A","value":"one"}]})),
+  )
+  .await;
+  let revision = preview["data"]["revision"].as_str().unwrap();
+  let (status, snapshot, _) = call(
+    &router,
+    "POST",
+    &format!("{base}/export"),
+    Some(&token),
+    None,
+  )
+  .await;
+  assert_eq!(status, 200);
+  assert_eq!(snapshot["data"]["revision"], revision);
+  assert!(snapshot["data"]["entries"].as_array().unwrap().is_empty());
+  assert!(snapshot["data"]["envLayout"].is_null());
+  let (status, _, _) = call(
+    &router,
+    "PUT",
+    &format!("{base}/B"),
+    Some(&token),
+    Some(json!({"value":"concurrent"})),
+  )
+  .await;
+  assert_eq!(status, 200);
+  let (status, body, _) = call(
+    &router,
+    "POST",
+    &format!("{base}/import"),
+    Some(&token),
+    Some(json!({"mode":"replace","dryRun":false,"expectedRevision":revision,"entries":[{"key":"A","value":"one"}]})),
+  )
+  .await;
+  assert_eq!(status, 409);
+  assert!(body["error"]["IMPORT_PREVIEW_STALE"].is_string());
+  let (status, body, _) = call(
+    &router,
+    "POST",
+    &format!("{base}/import"),
+    Some(&token),
+    Some(json!({"mode":"replace","dryRun":true,"expectedRevision":revision,"entries":[]})),
+  )
+  .await;
+  assert_eq!(status, 409);
+  assert!(body["error"]["IMPORT_PREVIEW_STALE"].is_string());
+  state.db.close().await;
+}
+
+#[tokio::test]
+async fn failed_audit_insert_rolls_back_project_rename() {
+  let (_directory, state, router, token, _environment_id) = admin_environment().await;
+  sqlx::query(
+    "CREATE TRIGGER reject_audit BEFORE INSERT ON audit_events BEGIN SELECT RAISE(FAIL, 'audit disabled'); END",
+  )
+  .execute(state.db.pool())
+  .await
+  .unwrap();
+  let (status, _, _) = call(
+    &router,
+    "PATCH",
+    "/api/v1/projects/concurrency-test",
+    Some(&token),
+    Some(json!({"name":"should-not-stick"})),
+  )
+  .await;
+  assert_eq!(status, 500);
+  let name: String = sqlx::query_scalar("SELECT name FROM projects WHERE name='concurrency-test'")
+    .fetch_one(state.db.pool())
+    .await
+    .unwrap();
+  assert_eq!(name, "concurrency-test");
+  state.db.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_token_revokes_create_one_transition_and_one_audit() {
+  let (_directory, state, router, token, environment_id) = admin_environment().await;
+  let (_, created, _) = call(
+    &router,
+    "POST",
+    &format!("/api/v1/environments/{environment_id}/tokens"),
+    Some(&token),
+    Some(json!({"name":"deploy","role":"runner"})),
+  )
+  .await;
+  let token_id = created["data"]["token"]["id"].as_str().unwrap().to_owned();
+  let path = format!("/api/v1/tokens/{token_id}/revoke");
+  let barrier = std::sync::Arc::new(Barrier::new(2));
+  let mut tasks = Vec::new();
+  for _ in 0..2 {
+    let router = router.clone();
+    let admin_token = token.clone();
+    let path = path.clone();
+    let barrier = barrier.clone();
+    tasks.push(tokio::spawn(async move {
+      barrier.wait().await;
+      call(&router, "POST", &path, Some(&admin_token), None)
+        .await
+        .0
+    }));
+  }
+  let mut statuses = Vec::new();
+  for task in tasks {
+    statuses.push(task.await.unwrap());
+  }
+  statuses.sort_unstable();
+  assert_eq!(statuses, [200, 409]);
+  let audit_count: i64 =
+    sqlx::query_scalar("SELECT COUNT(*) FROM audit_events WHERE action='token.revoked'")
+      .fetch_one(state.db.pool())
+      .await
+      .unwrap();
+  assert_eq!(audit_count, 1);
+  state.db.close().await;
+}
+
+#[tokio::test]
+async fn health_and_openapi_are_available() {
+  let (_directory, state, router) = test_app().await;
+  let (status, body, _) = call(&router, "GET", "/api/v1/health", None, None).await;
+  assert_eq!(status, 200);
+  assert_eq!(body["data"]["product"], "dopbase");
+  let (status, spec, _) = call(&router, "GET", "/api/v1/openapi.json", None, None).await;
+  assert_eq!(status, 200);
+  assert_eq!(spec["info"]["title"], "Dopbase API");
+  assert_eq!(
+    spec["info"]["description"],
+    "API for managing Dopbase projects, environments, secrets, access, backups, and instance settings."
+  );
+  for path in [
+    "/api/v1/health",
+    "/api/v1/bootstrap/status",
+    "/api/v1/bootstrap/admin",
+    "/api/v1/auth/login",
+    "/api/v1/auth/logout",
+    "/api/v1/auth/session",
+    "/api/v1/auth/reauthenticate",
+    "/api/v1/auth/change-password",
+    "/api/v1/projects",
+    "/api/v1/projects/init",
+    "/api/v1/projects/{project_ref}",
+    "/api/v1/environments",
+    "/api/v1/environments/resolve",
+    "/api/v1/projects/{project_ref}/environments",
+    "/api/v1/environments/{environment_id}",
+    "/api/v1/environments/{environment_id}/secrets",
+    "/api/v1/environments/{environment_id}/secrets/{key}",
+    "/api/v1/environments/{environment_id}/secrets/{key}/reveal",
+    "/api/v1/environments/{environment_id}/secrets/import",
+    "/api/v1/environments/{environment_id}/secrets/layout",
+    "/api/v1/environments/{environment_id}/secrets/export",
+    "/api/v1/environments/{environment_id}/secrets/runtime",
+    "/api/v1/environments/{environment_id}/tokens",
+    "/api/v1/tokens/{token_id}/revoke",
+    "/api/v1/audit-events",
+    "/api/v1/backups",
+    "/api/v1/backups/master-key",
+    "/api/v1/backups/upload",
+    "/api/v1/backups/{key}",
+    "/api/v1/backups/{key}/restore",
+    "/api/v1/instance",
+    "/api/v1/status",
+    "/api/v1/instance/factory-reset",
+    "/api/v1/users",
+    "/api/v1/users/{id}",
+    "/api/v1/service-accounts",
+    "/api/v1/service-accounts/{id}",
+    "/api/v1/service-accounts/{id}/tokens",
+    "/api/v1/service-accounts/{id}/tokens/{token_id}/revoke",
+  ] {
+    assert!(
+      spec["paths"][path].is_object(),
+      "missing OpenAPI path {path}"
+    );
+  }
+  for schema in [
+    "ErrorBody",
+    "UserResponse",
+    "CreateUserRequest",
+    "UpdateUserRequest",
+    "AdminRole",
+    "InstanceStatus",
+    "StatusResponse",
+    "FactoryResetPreview",
+    "FactoryResetRequest",
+    "ServiceAccountResponse",
+    "CreateServiceAccountRequest",
+    "AgentTokenResponse",
+    "CreateAgentTokenRequest",
+    "CreatedAgentTokenResponse",
+  ] {
+    assert!(
+      spec["components"]["schemas"][schema].is_object(),
+      "missing OpenAPI schema {schema}"
+    );
+  }
+
+  assert_eq!(
+    spec["paths"]["/api/v1/users"]["get"]["summary"],
+    "List users"
+  );
+  assert_eq!(
+    spec["paths"]["/api/v1/users/{id}"]["get"]["summary"],
+    "Show a user"
+  );
+  assert_eq!(
+    spec["paths"]["/api/v1/users"]["post"]["summary"],
+    "Create a user"
+  );
+  assert_eq!(
+    spec["paths"]["/api/v1/users/{id}"]["patch"]["summary"],
+    "Update a user"
+  );
+  assert_eq!(
+    spec["paths"]["/api/v1/users/{id}"]["delete"]["summary"],
+    "Delete a user"
+  );
+  assert_eq!(
+    spec["paths"]["/api/v1/status"]["get"]["summary"],
+    "Show public instance status"
+  );
+  assert_eq!(
+    spec["paths"]["/api/v1/instance/factory-reset"]["get"]["summary"],
+    "Preview factory reset"
+  );
+  assert_eq!(
+    spec["paths"]["/api/v1/instance/factory-reset"]["post"]["summary"],
+    "Perform a factory reset"
+  );
+  assert_eq!(
+    spec["paths"]["/api/v1/service-accounts"]["get"]["summary"],
+    "List service accounts"
+  );
+  assert_eq!(
+    spec["paths"]["/api/v1/service-accounts"]["post"]["summary"],
+    "Create a service account"
+  );
+  assert_eq!(
+    spec["paths"]["/api/v1/service-accounts/{id}"]["get"]["summary"],
+    "Show a service account"
+  );
+  assert_eq!(
+    spec["paths"]["/api/v1/service-accounts/{id}"]["delete"]["summary"],
+    "Delete a service account"
+  );
+  assert_eq!(
+    spec["paths"]["/api/v1/service-accounts/{id}/tokens"]["get"]["summary"],
+    "List service account tokens"
+  );
+  assert_eq!(
+    spec["paths"]["/api/v1/service-accounts/{id}/tokens"]["post"]["summary"],
+    "Create a service account token"
+  );
+  assert_eq!(
+    spec["paths"]["/api/v1/service-accounts/{id}/tokens/{token_id}/revoke"]["post"]["summary"],
+    "Revoke a service account token"
+  );
+  state.db.close().await;
+}
+
+#[tokio::test]
+async fn docs_routes_are_disabled_by_default() {
+  let (_directory, state, router) = test_app_with_docs(false).await;
+  let (status, body, _) = call(&router, "GET", "/api/v1/health", None, None).await;
+  assert_eq!(status, 200);
+  assert_eq!(body["data"]["product"], "dopbase");
+  let (status, body, _) = call(&router, "GET", "/api/v1/openapi.json", None, None).await;
+  assert_eq!(status, 404);
+  assert_eq!(
+    body,
+    json!({"success":false,"error":{"REQUEST_INVALID":"The requested API route was not found."}})
+  );
+  let (status, _, _) = call(&router, "GET", "/api/docs", None, None).await;
+  assert_eq!(status, 404);
+  state.db.close().await;
+}
+
+#[tokio::test]
+async fn docs_can_be_enabled_per_config() {
+  let (_directory, state, router) = test_app_with_docs(true).await;
+  let request = Request::builder()
+    .uri("/api/docs/")
+    .body(Body::empty())
+    .unwrap();
+  let response = router.clone().oneshot(request).await.unwrap();
+  assert_eq!(response.status().as_u16(), 200, "trailing-slash docs route");
+  assert_eq!(
+    response.headers().get(header::CONTENT_TYPE).unwrap(),
+    "text/html"
+  );
+  let (status, spec, _) = call(&router, "GET", "/api/v1/openapi.json", None, None).await;
+  assert_eq!(status, 200);
+  assert!(spec["paths"]["/api/v1/health"].is_object());
+  state.db.close().await;
+}
+
+#[tokio::test]
+async fn embedded_admin_assets_keep_spa_and_cache_behavior() {
+  let (_directory, state, router) = test_app().await;
+
+  let root = get(&router, "/").await;
+  assert_eq!(root.status(), 200);
+  assert_eq!(root.headers()[header::CONTENT_TYPE], "text/html");
+  assert_eq!(root.headers()[header::CACHE_CONTROL], "no-cache");
+
+  let spa_route = get(&router, "/projects/example/settings").await;
+  assert_eq!(spa_route.status(), 200);
+  assert_eq!(spa_route.headers()[header::CONTENT_TYPE], "text/html");
+  assert_eq!(spa_route.headers()[header::CACHE_CONTROL], "no-cache");
+
+  let asset = get(&router, "/favicon.svg").await;
+  assert_eq!(asset.status(), 200);
+  assert_eq!(asset.headers()[header::CONTENT_TYPE], "image/svg+xml");
+  assert_eq!(
+    asset.headers()[header::CACHE_CONTROL],
+    "public, max-age=31536000, immutable"
+  );
+
+  assert_eq!(get(&router, "/missing.js").await.status(), 404);
+  state.db.close().await;
+}
+
+#[tokio::test]
+async fn validation_uses_required_error_map() {
+  let (_directory, state, router) = test_app().await;
+  let setup = state.setup.read().await.token.clone().unwrap();
+  let (status, body, _) = call(
+    &router,
+    "POST",
+    "/api/v1/bootstrap/admin",
+    None,
+    Some(json!({"setupToken":setup,"email":"invalid","password":"123456789012"})),
+  )
+  .await;
+  assert_eq!(status, 422);
+  assert_eq!(
+    body,
+    json!({"success":false,"error":{"EMAIL_INVAILD":"Please use proper email"}})
+  );
+  state.db.close().await;
+}
+
+#[tokio::test]
+async fn malformed_json_uses_required_error_map() {
+  let (_directory, state, router) = test_app().await;
+  let request = Request::builder()
+    .method("POST")
+    .uri("/api/v1/auth/login")
+    .header(header::CONTENT_TYPE, "application/json")
+    .body(Body::from("{"))
+    .unwrap();
+  let response = router.oneshot(request).await.unwrap();
+  assert_eq!(response.status(), 400);
+  let body: Value =
+    serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+  assert_eq!(
+    body,
+    json!({"success":false,"error":{"REQUEST_INVALID":"The request could not be processed."}})
+  );
+  state.db.close().await;
+}
+
+#[tokio::test]
+async fn deleting_project_with_nested_folders_succeeds() {
+  let (_directory, state, router) = test_app().await;
+  let setup = state.setup.read().await.token.clone().unwrap();
+  let (status, bootstrap, headers) = call(
+    &router,
+    "POST",
+    "/api/v1/bootstrap/admin",
+    None,
+    Some(json!({"setupToken":setup,"email":"admin@example.com","password":"correct-horse-123"})),
+  )
+  .await;
+  assert_eq!(status, 201);
+  let cookie = headers
+    .get(header::SET_COOKIE)
+    .unwrap()
+    .to_str()
+    .unwrap()
+    .split(';')
+    .next()
+    .unwrap()
+    .to_owned();
+  let csrf = bootstrap["data"]["csrfToken"].as_str().unwrap();
+  let (_, login, _) = call(
+    &router,
+    "POST",
+    "/api/v1/auth/login",
+    None,
+    Some(json!({"email":"admin@example.com","password":"correct-horse-123","sessionKind":"cli"})),
+  )
+  .await;
+  let token = login["data"]["token"].as_str().unwrap();
+  let (status, project, _) = call(
+    &router,
+    "POST",
+    "/api/v1/projects",
+    Some(token),
+    Some(json!({"name":"nested-folders"})),
+  )
+  .await;
+  assert_eq!(status, 201);
+  let project_id = project["data"]["id"].as_str().unwrap();
+  let (status, root, _) = call(
+    &router,
+    "POST",
+    &format!("/api/v1/projects/{project_id}/files/folders"),
+    Some(token),
+    Some(json!({"name":"parent"})),
+  )
+  .await;
+  assert_eq!(status, 201);
+  let parent_id = root["data"]["id"].as_str().unwrap();
+  let (status, _, _) = call(
+    &router,
+    "POST",
+    &format!("/api/v1/projects/{project_id}/files/folders"),
+    Some(token),
+    Some(json!({"name":"child","parentId":parent_id})),
+  )
+  .await;
+  assert_eq!(status, 201);
+
+  let response = router
+    .clone()
+    .oneshot(
+      Request::builder()
+        .method("DELETE")
+        .uri(format!("/api/v1/projects/{project_id}"))
+        .header(header::COOKIE, cookie)
+        .header("x-dopbase-csrf", csrf)
+        .body(Body::empty())
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+  assert_eq!(response.status().as_u16(), 200);
+  state.db.close().await;
+}
+
+#[tokio::test]
+async fn unknown_api_route_uses_required_error_map() {
+  let (_directory, state, router) = test_app().await;
+  let (status, body, _) = call(&router, "GET", "/api/v1/unknown", None, None).await;
+  assert_eq!(status, 404);
+  assert_eq!(
+    body,
+    json!({"success":false,"error":{"REQUEST_INVALID":"The requested API route was not found."}})
+  );
+  state.db.close().await;
+}
+
+#[tokio::test]
+async fn end_to_end_admin_and_runner_flow() {
+  let (_directory, state, router) = test_app().await;
+  let setup = state.setup.read().await.token.clone().unwrap();
+  let (status, _, _) = call(
+    &router,
+    "POST",
+    "/api/v1/bootstrap/admin",
+    None,
+    Some(json!({"setupToken":setup,"email":"admin@example.com","password":"correct-horse-123"})),
+  )
+  .await;
+  assert_eq!(status, 201);
+  let (status, login, _) = call(
+    &router,
+    "POST",
+    "/api/v1/auth/login",
+    None,
+    Some(json!({"email":"admin@example.com","password":"correct-horse-123","sessionKind":"cli"})),
+  )
+  .await;
+  assert_eq!(status, 200);
+  let admin_token = login["data"]["token"].as_str().unwrap();
+  let (status, project, _) = call(
+    &router,
+    "POST",
+    "/api/v1/projects",
+    Some(admin_token),
+    Some(json!({"name":"payment-service"})),
+  )
+  .await;
+  assert_eq!(status, 201);
+  assert_eq!(project["data"]["name"], "payment-service");
+  let (status, environment, _) = call(
+    &router,
+    "POST",
+    "/api/v1/projects/payment-service/environments",
+    Some(admin_token),
+    Some(json!({"name":"production"})),
+  )
+  .await;
+  assert_eq!(status, 201);
+  let environment_id = environment["data"]["id"].as_str().unwrap();
+  let secret_path = format!("/api/v1/environments/{environment_id}/secrets/DATABASE_URL");
+  let (status, _, _) = call(
+    &router,
+    "PUT",
+    &secret_path,
+    Some(admin_token),
+    Some(json!({"value":"postgres://private"})),
+  )
+  .await;
+  assert_eq!(status, 200);
+  let (status, reveal, _) = call(
+    &router,
+    "POST",
+    &format!("{secret_path}/reveal"),
+    Some(admin_token),
+    None,
+  )
+  .await;
+  assert_eq!(status, 200);
+  assert_eq!(reveal["data"]["value"], "postgres://private");
+  let (status, created, _) = call(
+    &router,
+    "POST",
+    &format!("/api/v1/environments/{environment_id}/tokens"),
+    Some(admin_token),
+    Some(json!({"name":"production-server","role":"runner"})),
+  )
+  .await;
+  assert_eq!(status, 201);
+  let runner = created["data"]["plaintextToken"].as_str().unwrap();
+  let (status, runtime, _) = call(
+    &router,
+    "GET",
+    &format!("/api/v1/environments/{environment_id}/secrets/runtime"),
+    Some(runner),
+    None,
+  )
+  .await;
+  assert_eq!(status, 200);
+  assert_eq!(runtime["data"]["entries"][0]["value"], "postgres://private");
+  let (status, denied, _) = call(&router, "GET", "/api/v1/projects", Some(runner), None).await;
+  assert_eq!(status, 403);
+  assert!(denied["error"]["AUTHORIZATION_DENIED"].is_string());
+  let (status, audit, _) = call(
+    &router,
+    "GET",
+    "/api/v1/audit-events?limit=10",
+    Some(admin_token),
+    None,
+  )
+  .await;
+  assert_eq!(status, 200);
+  assert!(!audit["data"]["items"].as_array().unwrap().is_empty());
+  state.db.close().await;
+}
+
+#[tokio::test]
+async fn env_layout_persists_with_import_and_omits_values() {
+  let (_directory, state, router) = test_app().await;
+  let setup = state.setup.read().await.token.clone().unwrap();
+  let (status, _, _) = call(
+    &router,
+    "POST",
+    "/api/v1/bootstrap/admin",
+    None,
+    Some(json!({"setupToken":setup,"email":"admin@example.com","password":"correct-horse-123"})),
+  )
+  .await;
+  assert_eq!(status, 201);
+  let (status, login, _) = call(
+    &router,
+    "POST",
+    "/api/v1/auth/login",
+    None,
+    Some(json!({"email":"admin@example.com","password":"correct-horse-123","sessionKind":"cli"})),
+  )
+  .await;
+  assert_eq!(status, 200);
+  let token = login["data"]["token"].as_str().unwrap();
+  let (status, _, _) = call(
+    &router,
+    "POST",
+    "/api/v1/projects",
+    Some(token),
+    Some(json!({"name":"layout-service"})),
+  )
+  .await;
+  assert_eq!(status, 201);
+  let (status, environment, _) = call(
+    &router,
+    "POST",
+    "/api/v1/projects/layout-service/environments",
+    Some(token),
+    Some(json!({"name":"production"})),
+  )
+  .await;
+  assert_eq!(status, 201);
+  let environment_id = environment["data"]["id"].as_str().unwrap();
+  let base = format!("/api/v1/environments/{environment_id}/secrets");
+
+  // No layout is stored until the editor saves one.
+  let (status, body, _) = call(&router, "GET", &format!("{base}/layout"), Some(token), None).await;
+  assert_eq!(status, 200);
+  assert!(body["data"]["layout"].is_null());
+
+  // A dry-run import carrying a layout must not persist it.
+  let layout_text = "# connection\nDATABASE_URL=\n\n# app\nAPI_KEY=\n";
+  let (status, dry, _) = call(
+    &router,
+    "POST",
+    &format!("{base}/import"),
+    Some(token),
+    Some(json!({
+        "mode":"replace",
+        "dryRun":true,
+        "entries":[
+            {"key":"DATABASE_URL","value":"postgres://private"},
+            {"key":"API_KEY","value":"k-123"}
+        ],
+        "envLayout":layout_text
+    })),
+  )
+  .await;
+  assert_eq!(status, 200);
+  assert_eq!(dry["data"]["addedKeys"].as_array().unwrap().len(), 2);
+  let revision = dry["data"]["revision"].clone();
+  let (status, body, _) = call(&router, "GET", &format!("{base}/layout"), Some(token), None).await;
+  assert_eq!(status, 200);
+  assert!(body["data"]["layout"].is_null());
+
+  // Applying the import persists the layout exactly as submitted — and
+  // never with secret values inside.
+  let (status, _, _) = call(
+    &router,
+    "POST",
+    &format!("{base}/import"),
+    Some(token),
+    Some(json!({
+        "mode":"replace",
+        "dryRun":false,
+        "entries":[
+            {"key":"DATABASE_URL","value":"postgres://private"},
+            {"key":"API_KEY","value":"k-123"}
+        ],
+        "envLayout":layout_text,
+        "expectedRevision":revision
+    })),
+  )
+  .await;
+  assert_eq!(status, 200);
+  let (status, body, _) = call(&router, "GET", &format!("{base}/layout"), Some(token), None).await;
+  assert_eq!(status, 200);
+  assert_eq!(body["data"]["layout"], layout_text);
+  assert!(
+    !body["data"]["layout"]
+      .as_str()
+      .unwrap()
+      .contains("postgres")
+  );
+
+  let (_, snapshot, _) = call(
+    &router,
+    "POST",
+    &format!("{base}/export"),
+    Some(token),
+    None,
+  )
+  .await;
+  assert_eq!(snapshot["data"]["envLayout"], layout_text);
+  assert_eq!(snapshot["data"]["entries"].as_array().unwrap().len(), 2);
+  for layout in [
+    "API_KEY=plaintext-private-marker",
+    "API_KEY=\nAPI_KEY=",
+    "not a slot",
+  ] {
+    for dry_run in [true, false] {
+      let (status, body, _) = call(&router, "POST", &format!("{base}/import"), Some(token),
+        Some(json!({"mode":"replace","dryRun":dry_run,"entries":[],"envLayout":layout,"expectedRevision":snapshot["data"]["revision"]}))).await;
+      assert_eq!(status, 422);
+      assert!(body["error"]["ENV_LAYOUT_INVALID"].is_string());
+      assert!(!body.to_string().contains("plaintext-private-marker"));
+    }
+  }
+
+  // A layout beyond the size limit is rejected.
+  let huge = "x".repeat(64 * 1024 + 1);
+  let (status, _, _) = call(
+    &router,
+    "POST",
+    &format!("{base}/import"),
+    Some(token),
+    Some(json!({
+        "mode":"replace",
+        "dryRun":false,
+        "entries":[{"key":"DATABASE_URL","value":"v"}],
+        "envLayout":huge
+    })),
+  )
+  .await;
+  assert_eq!(status, 422);
+  state.db.close().await;
+}
+
+#[tokio::test]
+async fn password_reverification_is_rate_limited() {
+  let (_directory, state, router, token, _environment_id) = admin_environment().await;
+  // Five wrong attempts exhaust the account budget shared by reauthenticate,
+  // change-password, and factory-reset. The sixth is throttled.
+  for _ in 0..5 {
+    let (status, _, _) = call(
+      &router,
+      "POST",
+      "/api/v1/auth/reauthenticate",
+      Some(&token),
+      Some(json!({"password":"wrong-password"})),
+    )
+    .await;
+    assert_eq!(status, 401);
+  }
+  let (status, body, _) = call(
+    &router,
+    "POST",
+    "/api/v1/auth/reauthenticate",
+    Some(&token),
+    Some(json!({"password":"wrong-password"})),
+  )
+  .await;
+  assert_eq!(status, 429);
+  assert!(body["error"].get("RATE_LIMITED").is_some());
+  // Even the correct password is refused while locked out.
+  let (status, _, _) = call(
+    &router,
+    "POST",
+    "/api/v1/auth/reauthenticate",
+    Some(&token),
+    Some(json!({"password":"correct-horse-123"})),
+  )
+  .await;
+  assert_eq!(status, 429);
+  state.db.close().await;
+}
+
+#[tokio::test]
+async fn security_headers_are_applied_to_every_response() {
+  let (_directory, state, router, _token, _environment_id) = admin_environment().await;
+  let (status, _, headers) = call(&router, "GET", "/api/v1/health", None, None).await;
+  assert_eq!(status, 200);
+  assert_eq!(headers.get("x-content-type-options").unwrap(), "nosniff");
+  assert_eq!(headers.get("x-frame-options").unwrap(), "DENY");
+  assert_eq!(headers.get("referrer-policy").unwrap(), "no-referrer");
+  assert!(
+    headers
+      .get("content-security-policy")
+      .unwrap()
+      .to_str()
+      .unwrap()
+      .contains("frame-ancestors 'none'")
+  );
+  // API responses must never be cacheable.
+  assert_eq!(headers.get("cache-control").unwrap(), "no-store");
+  // Non-API responses keep the hardening headers but their own caching.
+  let (status, _, headers) = call(&router, "GET", "/", None, None).await;
+  assert_eq!(status, 200);
+  assert_eq!(headers.get("x-content-type-options").unwrap(), "nosniff");
+  assert_eq!(headers.get("cache-control").unwrap(), "no-cache");
+  state.db.close().await;
+}
+
+#[tokio::test]
+async fn runner_expiry_is_enforced_and_existing_default_stays_unlimited() {
+  let (_directory, state, router, admin, environment_id) = admin_environment().await;
+  let path = format!("/api/v1/environments/{environment_id}/tokens");
+  let (status, created, _) = call(
+    &router,
+    "POST",
+    &path,
+    Some(&admin),
+    Some(json!({"name":"short","role":"runner","expiresIn":"1h"})),
+  )
+  .await;
+  assert_eq!(status, 201);
+  assert!(created["data"]["token"]["expiresAt"].is_string());
+  let runner = created["data"]["plaintextToken"].as_str().unwrap();
+  let token_id = created["data"]["token"]["id"].as_str().unwrap();
+  let runtime = format!("/api/v1/environments/{environment_id}/secrets/runtime");
+  let (status, _, _) = call(&router, "GET", &runtime, Some(runner), None).await;
+  assert_eq!(status, 200);
+  sqlx::query("UPDATE runner_tokens SET expires_at=? WHERE id=?")
+    .bind((chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339())
+    .bind(token_id)
+    .execute(state.db.pool())
+    .await
+    .unwrap();
+  let (status, _, _) = call(&router, "GET", &runtime, Some(runner), None).await;
+  assert_eq!(status, 401);
+  let (status, counts, _) = call(&router, "GET", "/api/v1/status", Some(&admin), None).await;
+  assert_eq!(status, 200);
+  assert_eq!(counts["data"]["activeRunnerTokens"], 0);
+
+  let (status, default, _) = call(
+    &router,
+    "POST",
+    &path,
+    Some(&admin),
+    Some(json!({"name":"unlimited","role":"runner"})),
+  )
+  .await;
+  assert_eq!(status, 201);
+  assert!(default["data"]["token"]["expiresAt"].is_null());
+  let (status, _, _) = call(
+    &router,
+    "POST",
+    &path,
+    Some(&admin),
+    Some(json!({"name":"limit","role":"runner","expiresIn":"1095d"})),
+  )
+  .await;
+  assert_eq!(status, 201);
+  let (status, _, _) = call(
+    &router,
+    "POST",
+    &path,
+    Some(&admin),
+    Some(json!({"name":"too-long","role":"runner","expiresIn":"1096d"})),
+  )
+  .await;
+  assert_eq!(status, 400);
+  state.db.close().await;
+}
+
+#[tokio::test]
+async fn browser_session_survives_past_the_previous_idle_and_absolute_expiry() {
+  let (_directory, state, router) = test_app().await;
+  let setup = state.setup.read().await.token.clone().unwrap();
+  let (status, _, _) = call(
+    &router,
+    "POST",
+    "/api/v1/bootstrap/admin",
+    None,
+    Some(json!({"setupToken":setup,"email":"admin@example.com","password":"correct-horse-123"})),
+  )
+  .await;
+  assert_eq!(status, 201);
+
+  let (status, login, headers) = call(
+    &router,
+    "POST",
+    "/api/v1/auth/login",
+    None,
+    Some(
+      json!({"email":"admin@example.com","password":"correct-horse-123","sessionKind":"browser"}),
+    ),
+  )
+  .await;
+  assert_eq!(status, 200);
+  let cookie = headers.get("set-cookie").unwrap().to_str().unwrap();
+  let cookie_token = cookie
+    .split(';')
+    .next()
+    .unwrap()
+    .strip_prefix("dopbase_session=")
+    .unwrap();
+  let token_hash = app::services::token::hash(cookie_token);
+  sqlx::query("UPDATE sessions SET idle_expires_at=?, absolute_expires_at=? WHERE token_hash=?")
+    .bind("2000-01-01T00:00:00Z")
+    .bind("2000-01-01T00:00:00Z")
+    .bind(token_hash)
+    .execute(state.db.pool())
+    .await
+    .unwrap();
+
+  let request = Request::builder()
+    .uri("/api/v1/projects")
+    .header(header::COOKIE, format!("dopbase_session={cookie_token}"))
+    .body(Body::empty())
+    .unwrap();
+  let response = router.clone().oneshot(request).await.unwrap();
+  assert_eq!(response.status().as_u16(), 200);
+
+  assert!(cookie.contains("Max-Age=2147483647"));
+  assert!(login["data"]["csrfToken"].is_string());
+  state.db.close().await;
+}
+
+#[tokio::test]
+async fn disabled_web_ui_blocks_pages_and_assets_but_keeps_cli_api_and_optional_docs() {
+  for docs_enabled in [false, true] {
+    let (_directory, state, router) = test_app_with_ui(docs_enabled, false).await;
+    for path in [
+      "/",
+      "/index.html",
+      "/login",
+      "/setup",
+      "/projects/example/settings",
+      "/favicon.svg",
+      "/missing.js",
+    ] {
+      let (status, body, headers) = call(&router, "GET", path, None, None).await;
+      assert_eq!(status, 404, "{path}");
+      assert_eq!(headers[header::CONTENT_TYPE], "application/json");
+      assert_eq!(
+        body,
+        json!({"success":false,"error":{"REQUEST_INVALID":"The requested route was not found."}})
+      );
+      assert_eq!(headers["x-content-type-options"], "nosniff");
+    }
+    let (status, body, _) = call(&router, "GET", "/api/v1/missing", None, None).await;
+    assert_eq!(status, 404);
+    assert_eq!(
+      body["error"]["REQUEST_INVALID"],
+      "The requested API route was not found."
+    );
+    assert_eq!(get(&router, "/api/v1/health").await.status(), 200);
+    assert_eq!(
+      get(&router, "/api/docs/").await.status(),
+      if docs_enabled { 200 } else { 404 }
+    );
+    assert_eq!(
+      get(&router, "/api/v1/openapi.json").await.status(),
+      if docs_enabled { 200 } else { 404 }
+    );
+    let setup = state.setup.read().await.token.clone().unwrap();
+    let (status, _, _) = call(
+      &router,
+      "POST",
+      "/api/v1/bootstrap/admin",
+      None,
+      Some(json!({"setupToken":setup,"email":"admin@example.com","password":"correct-horse-123"})),
+    )
+    .await;
+    assert_eq!(status, 201);
+    let (status, login, _) = call(
+      &router,
+      "POST",
+      "/api/v1/auth/login",
+      None,
+      Some(json!({"email":"admin@example.com","password":"correct-horse-123","sessionKind":"cli"})),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let token = login["data"]["token"].as_str().unwrap();
+    let (status, _, _) = call(
+      &router,
+      "POST",
+      "/api/v1/projects",
+      Some(token),
+      Some(json!({"name":"cli-only"})),
+    )
+    .await;
+    assert_eq!(status, 201);
+    state.db.close().await;
+  }
+}

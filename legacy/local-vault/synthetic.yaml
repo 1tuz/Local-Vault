@@ -1,0 +1,33 @@
+format: local-vault-export-v1
+entries:
+  - name: Demo API key
+    folder: Examples
+    kind: api
+    encoding: utf-8
+    content: SYNTHETIC-EXAMPLE-NO-REAL-CREDENTIAL
+    metadata:
+      base_url: https://api.example.org/v1
+      methods: GET
+      header_name: Authorization
+      header_prefix: 'Bearer '
+    agent_allowed: false
+  - name: Demo kubeconfig
+    folder: Examples
+    kind: kubeconfig
+    encoding: utf-8
+    content: |
+      apiVersion: v1
+      kind: Config
+      clusters: []
+      users: []
+      contexts: []
+      current-context: ''
+    metadata: {}
+    agent_allowed: false
+  - name: Demo password
+    folder: Examples
+    kind: secret
+    encoding: utf-8
+    content: SYNTHETIC-DEMO-PASSWORD
+    metadata: {}
+    agent_allowed: false

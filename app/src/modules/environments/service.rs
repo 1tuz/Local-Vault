@@ -1,0 +1,274 @@
+use super::{model::*, repository};
+use crate::modules::common;
+use crate::{
+  constants::errors::{ENVIRONMENT_NAME_INVALID, TOKEN_SCOPE_INVALID},
+  http::HttpError,
+  models::{AffectedCounts, AuthIdentity},
+  state::AppState,
+  utils::generator,
+};
+use chrono::Utc;
+use sqlx::{Sqlite, Transaction};
+
+fn unique(error: sqlx::Error) -> HttpError {
+  if error.to_string().contains("UNIQUE") {
+    HttpError::conflict(
+      "ENVIRONMENT_ALREADY_EXISTS",
+      "An environment with this name already exists in the project.",
+    )
+  } else {
+    HttpError::from(error)
+  }
+}
+
+pub(crate) async fn insert_generated(
+  tx: &mut Transaction<'_, Sqlite>,
+  project_id: &str,
+  name: &str,
+  now: &str,
+) -> Result<String, HttpError> {
+  const MAX_ATTEMPTS: usize = 5;
+  for _ in 0..MAX_ATTEMPTS {
+    let id = generator::environment_id().map_err(|error| {
+      tracing::error!(%error, "failed to generate environment id");
+      HttpError::internal()
+    })?;
+    if repository::insert(tx, &id, project_id, name, now)
+      .await
+      .map_err(unique)?
+    {
+      return Ok(id);
+    }
+  }
+  tracing::error!(
+    attempts = MAX_ATTEMPTS,
+    "environment id generation collided repeatedly"
+  );
+  Err(HttpError::internal())
+}
+
+pub async fn list(
+  state: &AppState,
+  identity: &AuthIdentity,
+  project: Option<&str>,
+) -> Result<Vec<EnvironmentResponse>, HttpError> {
+  if let AuthIdentity::ServiceAccount {
+    environment_id: Some(environment_id),
+    ..
+  } = identity
+  {
+    let environment = show(state, environment_id).await?;
+    if project.is_some_and(|project| {
+      !project.eq_ignore_ascii_case(&environment.project_id)
+        && !project.eq_ignore_ascii_case(&environment.project_name)
+    }) {
+      return Ok(Vec::new());
+    }
+    return Ok(vec![environment]);
+  }
+  if let AuthIdentity::ServiceAccount {
+    project_id: Some(project_id),
+    environment_id: None,
+    ..
+  } = identity
+  {
+    let scoped_project = crate::modules::projects::service::show(state, project_id).await?;
+    if project.is_some_and(|project| {
+      !project.eq_ignore_ascii_case(&scoped_project.id)
+        && !project.eq_ignore_ascii_case(&scoped_project.name)
+    }) {
+      return Ok(Vec::new());
+    }
+    return Ok(repository::list(state.db.pool(), Some(&scoped_project.id)).await?);
+  }
+  crate::extractors::require_metadata_access(identity)?;
+  Ok(repository::list(state.db.pool(), project).await?)
+}
+pub async fn show(
+  state: &AppState,
+  id: &str,
+) -> Result<EnvironmentResponse, HttpError> {
+  repository::find_id(state.db.pool(), id)
+    .await?
+    .ok_or_else(|| {
+      HttpError::not_found(
+        "ENVIRONMENT_NOT_FOUND",
+        "The requested environment was not found.",
+      )
+    })
+}
+pub async fn resolve(
+  state: &AppState,
+  identity: &AuthIdentity,
+  reference: &str,
+) -> Result<EnvironmentResponse, HttpError> {
+  let environment = repository::resolve(state.db.pool(), reference)
+    .await?
+    .ok_or_else(|| {
+      HttpError::not_found(
+        "ENVIRONMENT_NOT_FOUND",
+        "The requested environment was not found.",
+      )
+    })?;
+  if let AuthIdentity::Runner { environment_id, .. } = identity
+    && *environment_id != environment.id
+  {
+    return Err(HttpError::forbidden(
+      TOKEN_SCOPE_INVALID,
+      "The runner token cannot access this environment.",
+    ));
+  }
+  if let AuthIdentity::ServiceAccount {
+    environment_id: Some(environment_id),
+    ..
+  } = identity
+    && *environment_id != environment.id
+  {
+    return Err(HttpError::forbidden(
+      TOKEN_SCOPE_INVALID,
+      "The agent token cannot access this environment.",
+    ));
+  }
+  if let AuthIdentity::ServiceAccount {
+    project_id: Some(project_id),
+    environment_id: None,
+    ..
+  } = identity
+    && *project_id != environment.project_id
+  {
+    return Err(HttpError::forbidden(
+      TOKEN_SCOPE_INVALID,
+      "The agent token cannot access an environment outside its project.",
+    ));
+  }
+  Ok(environment)
+}
+pub async fn create(
+  state: &AppState,
+  identity: &AuthIdentity,
+  project_ref: &str,
+  mut request: CreateEnvironmentRequest,
+) -> Result<EnvironmentResponse, HttpError> {
+  request.name =
+    common::normalize_display_name(request.name, ENVIRONMENT_NAME_INVALID, "Environment name")?;
+  let project = crate::modules::projects::service::show(state, project_ref).await?;
+  crate::extractors::require_project_write(identity, &project.id)?;
+  let now = Utc::now().to_rfc3339();
+  let mut tx = state.db.pool().begin_with("BEGIN IMMEDIATE").await?;
+  let id = insert_generated(&mut tx, &project.id, &request.name, &now).await?;
+  let (actor_type, actor_id, actor_label) = match identity {
+    AuthIdentity::Admin {
+      admin_id, email, ..
+    } => ("admin", admin_id.as_str(), Some(email.as_str())),
+    AuthIdentity::ServiceAccount {
+      service_account_id,
+      name,
+      ..
+    } => ("ai_agent", service_account_id.as_str(), Some(name.as_str())),
+    _ => unreachable!("environment writes require an admin or project token"),
+  };
+  common::audit(
+    &mut *tx,
+    actor_type,
+    Some(actor_id),
+    actor_label,
+    "environment.created",
+    Some(&project.id),
+    Some(&id),
+    Some("environment"),
+    Some(&id),
+    serde_json::json!({"name":request.name}),
+  )
+  .await?;
+  tx.commit().await?;
+  show(state, &id).await
+}
+pub async fn rename(
+  state: &AppState,
+  identity: &AuthIdentity,
+  id: &str,
+  mut request: RenameEnvironmentRequest,
+) -> Result<EnvironmentResponse, HttpError> {
+  request.name =
+    common::normalize_display_name(request.name, ENVIRONMENT_NAME_INVALID, "Environment name")?;
+  let (admin_id, email) = crate::extractors::require_project_manager(identity)?;
+  let environment = show(state, id).await?;
+  let mut tx = state.db.pool().begin().await?;
+  let updated = sqlx::query("UPDATE environments SET name=?,updated_at=? WHERE id=?")
+    .bind(&request.name)
+    .bind(Utc::now().to_rfc3339())
+    .bind(id)
+    .execute(&mut *tx)
+    .await
+    .map_err(unique)?;
+  if updated.rows_affected() != 1 {
+    return Err(HttpError::not_found(
+      "ENVIRONMENT_NOT_FOUND",
+      "The requested environment was not found.",
+    ));
+  }
+  common::audit(
+    &mut *tx,
+    "admin",
+    Some(admin_id),
+    Some(email),
+    "environment.renamed",
+    Some(&environment.project_id),
+    Some(id),
+    Some("environment"),
+    Some(id),
+    serde_json::json!({"oldName":environment.name,"newName":request.name}),
+  )
+  .await?;
+  tx.commit().await?;
+  show(state, id).await
+}
+pub async fn delete(
+  state: &AppState,
+  identity: &AuthIdentity,
+  id: &str,
+) -> Result<DeleteEnvironmentResponse, HttpError> {
+  let (admin_id, email) = crate::extractors::require_project_manager(identity)?;
+  let environment = show(state, id).await?;
+  let mut tx = state.db.pool().begin_with("BEGIN IMMEDIATE").await?;
+  let secrets: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM secrets WHERE environment_id=?")
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await?;
+  let tokens: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runner_tokens WHERE environment_id=?")
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await?;
+  let deleted = sqlx::query("DELETE FROM environments WHERE id=?")
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
+  if deleted.rows_affected() != 1 {
+    return Err(HttpError::not_found(
+      "ENVIRONMENT_NOT_FOUND",
+      "The requested environment was not found.",
+    ));
+  }
+  common::audit(
+    &mut *tx,
+    "admin",
+    Some(admin_id),
+    Some(email),
+    "environment.deleted",
+    Some(&environment.project_id),
+    Some(id),
+    Some("environment"),
+    Some(id),
+    serde_json::json!({"name":environment.name,"secrets":secrets,"tokens":tokens}),
+  )
+  .await?;
+  tx.commit().await?;
+  Ok(DeleteEnvironmentResponse {
+    affected: AffectedCounts {
+      projects: 0,
+      environments: 1,
+      secrets: secrets as u64,
+      tokens: tokens as u64,
+    },
+  })
+}

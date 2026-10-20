@@ -1,0 +1,844 @@
+use super::{
+  local_config::{ResolvedServer, normalize},
+  prompt, session,
+};
+use crate::constants::{api, config::ENV_TOKEN};
+use anyhow::{Context, Result, bail};
+use reqwest::Method;
+use serde::Serialize;
+use serde_json::{Value, json};
+use std::{
+  env, fmt,
+  io::{self, IsTerminal},
+  time::Duration,
+};
+use zeroize::Zeroizing;
+
+#[derive(Clone, Copy, Debug)]
+pub enum CliCancelled {
+  Login,
+  Setup,
+  TokenInput,
+  PasswordConfirmation,
+  ServerSwitch,
+  Confirmation,
+  SecretInput,
+  LocalVaultPassword,
+}
+
+impl fmt::Display for CliCancelled {
+  fn fmt(
+    &self,
+    formatter: &mut fmt::Formatter<'_>,
+  ) -> fmt::Result {
+    formatter.write_str(match self {
+      Self::Login => "Login cancelled.",
+      Self::Setup => "Setup cancelled.",
+      Self::TokenInput => "Token input cancelled.",
+      Self::PasswordConfirmation => "Password confirmation cancelled.",
+      Self::ServerSwitch => "Server switch cancelled.",
+      Self::Confirmation => "Operation cancelled.",
+      Self::SecretInput => "Secret input cancelled.",
+      Self::LocalVaultPassword => "Local Vault password prompt cancelled.",
+    })
+  }
+}
+
+impl std::error::Error for CliCancelled {}
+
+#[derive(Debug)]
+pub(crate) struct AvailabilityError {
+  message: String,
+}
+
+impl AvailabilityError {
+  pub(crate) fn new(message: impl Into<String>) -> Self {
+    Self {
+      message: message.into(),
+    }
+  }
+}
+
+impl fmt::Display for AvailabilityError {
+  fn fmt(
+    &self,
+    formatter: &mut fmt::Formatter<'_>,
+  ) -> fmt::Result {
+    formatter.write_str(&self.message)
+  }
+}
+
+impl std::error::Error for AvailabilityError {}
+
+pub(crate) fn is_availability_error(error: &anyhow::Error) -> bool {
+  error.downcast_ref::<AvailabilityError>().is_some()
+}
+
+#[derive(Debug)]
+struct ResponseError {
+  status: reqwest::StatusCode,
+  message: String,
+}
+
+impl fmt::Display for ResponseError {
+  fn fmt(
+    &self,
+    formatter: &mut fmt::Formatter<'_>,
+  ) -> fmt::Result {
+    write!(formatter, "{}: {}", self.status, self.message)
+  }
+}
+
+impl std::error::Error for ResponseError {}
+
+#[doc(hidden)]
+pub fn is_authentication_error(error: &anyhow::Error) -> bool {
+  error
+    .downcast_ref::<ResponseError>()
+    .is_some_and(|error| error.status == reqwest::StatusCode::UNAUTHORIZED)
+}
+
+#[doc(hidden)]
+pub fn is_conflict_error(error: &anyhow::Error) -> bool {
+  error
+    .downcast_ref::<ResponseError>()
+    .is_some_and(|error| error.status == reqwest::StatusCode::CONFLICT)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CredentialSource {
+  Environment,
+  EncryptedSession,
+  DesktopSession,
+  None,
+}
+
+impl CredentialSource {
+  pub fn as_str(self) -> &'static str {
+    match self {
+      Self::Environment => "environment",
+      Self::EncryptedSession => "encrypted_session",
+      Self::DesktopSession => "desktop_session",
+      Self::None => "none",
+    }
+  }
+}
+
+pub struct Credential {
+  pub token: Option<String>,
+  pub csrf_token: Option<String>,
+  pub source: CredentialSource,
+  pub email: Option<String>,
+}
+
+pub struct ApiClient {
+  pub base_url: String,
+  client: reqwest::Client,
+  token: Option<String>,
+  csrf_token: Option<String>,
+}
+
+const MAX_RUNTIME_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
+
+impl ApiClient {
+  pub fn new(
+    server: &ResolvedServer,
+    token: Option<String>,
+  ) -> Result<Self> {
+    let base_url = normalize(&server.url)?;
+    let https_only = base_url.starts_with("https://");
+    Ok(Self {
+      base_url,
+      client: reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .https_only(https_only)
+        .build()?,
+      token,
+      csrf_token: None,
+    })
+  }
+
+  fn from_credential(
+    server: &ResolvedServer,
+    credential: &Credential,
+  ) -> Result<Self> {
+    let mut client = Self::new(server, credential.token.clone())?;
+    client.csrf_token.clone_from(&credential.csrf_token);
+    Ok(client)
+  }
+  pub async fn request(
+    &self,
+    method: Method,
+    path: &str,
+    body: Option<Value>,
+  ) -> Result<Value> {
+    self.request_inner(method, path, body, false).await
+  }
+
+  pub(crate) async fn request_json<T>(
+    &self,
+    method: Method,
+    path: &str,
+    body: &T,
+  ) -> Result<Value>
+  where
+    T: Serialize + ?Sized,
+  {
+    let request = self.request_builder(method, path).json(body);
+    self.send_request(request, false).await
+  }
+
+  pub(crate) async fn request_runtime(
+    &self,
+    method: Method,
+    path: &str,
+    body: Option<Value>,
+  ) -> Result<Value> {
+    self.request_inner(method, path, body, true).await
+  }
+
+  async fn request_inner(
+    &self,
+    method: Method,
+    path: &str,
+    body: Option<Value>,
+    classify_availability: bool,
+  ) -> Result<Value> {
+    let empty_post = method == Method::POST && body.is_none();
+    let mut request = self.request_builder(method, path);
+    if let Some(body) = body {
+      request = request.json(&body);
+    } else if empty_post {
+      request = request.header(reqwest::header::CONTENT_LENGTH, 0);
+    }
+    self.send_request(request, classify_availability).await
+  }
+
+  fn request_builder(
+    &self,
+    method: Method,
+    path: &str,
+  ) -> reqwest::RequestBuilder {
+    let request = self
+      .client
+      .request(method, format!("{}{}", self.base_url, path));
+    let mut request = if let Some(token) = &self.token {
+      request.bearer_auth(token)
+    } else {
+      request
+    };
+    if let Some(csrf) = &self.csrf_token {
+      request = request.header("x-dopbase-csrf", csrf);
+    }
+    request
+  }
+
+  async fn send_request(
+    &self,
+    request: reqwest::RequestBuilder,
+    classify_availability: bool,
+  ) -> Result<Value> {
+    let response = request
+      .send()
+      .await
+      .map_err(|error| transport_error(error, &self.base_url, classify_availability))?;
+    let status = response.status();
+    if classify_availability && status.is_server_error() {
+      return Err(
+        AvailabilityError::new(format!("Dopbase at {} returned {status}", self.base_url)).into(),
+      );
+    }
+    let bytes = if classify_availability {
+      read_limited_response(response, MAX_RUNTIME_RESPONSE_BYTES).await?
+    } else {
+      response
+        .bytes()
+        .await
+        .context("failed to read server response body")?
+        .to_vec()
+    };
+    let bytes = Zeroizing::new(bytes);
+    let mut value: Value = match serde_json::from_slice(&bytes) {
+      Ok(value) => value,
+      Err(_) if !status.is_success() => {
+        return Err(
+          ResponseError {
+            status,
+            message: format!("server returned {status} (non-JSON response)"),
+          }
+          .into(),
+        );
+      }
+      Err(error) => return Err(error).context("server returned an invalid JSON response"),
+    };
+    if !status.is_success() {
+      let errors = value
+        .get("error")
+        .and_then(Value::as_object)
+        .map(|errors| {
+          errors
+            .iter()
+            .map(|(code, message)| {
+              format!("{code}: {}", message.as_str().unwrap_or("Request failed."))
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+        })
+        .unwrap_or_else(|| format!("server returned {status}"));
+      return Err(
+        ResponseError {
+          status,
+          message: errors,
+        }
+        .into(),
+      );
+    }
+    Ok(
+      value
+        .get_mut("data")
+        .map(Value::take)
+        .unwrap_or(Value::Null),
+    )
+  }
+  pub async fn health(&self) -> Result<Value> {
+    self.request(Method::GET, api::health::ROOT, None).await
+  }
+
+  pub async fn download_bytes(
+    &self,
+    path: &str,
+  ) -> Result<Vec<u8>> {
+    let mut request = self
+      .client
+      .request(Method::GET, format!("{}{}", self.base_url, path));
+    if let Some(token) = &self.token {
+      request = request.bearer_auth(token);
+    }
+    if let Some(csrf) = &self.csrf_token {
+      request = request.header("x-dopbase-csrf", csrf);
+    }
+    let response = request
+      .send()
+      .await
+      .map_err(|error| transport_error(error, &self.base_url, false))?;
+    let status = response.status();
+    if !status.is_success() {
+      let value: Value = response.json().await.unwrap_or(Value::Null);
+      let errors = value
+        .get("error")
+        .and_then(Value::as_object)
+        .map(|errors| {
+          errors
+            .iter()
+            .map(|(code, message)| {
+              format!("{code}: {}", message.as_str().unwrap_or("Download failed."))
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+        })
+        .unwrap_or_else(|| format!("server returned {status}"));
+      bail!(errors);
+    }
+    let bytes = response.bytes().await?.to_vec();
+    Ok(bytes)
+  }
+
+  pub async fn upload_multipart(
+    &self,
+    path: &str,
+    file_name: &str,
+    bytes: Vec<u8>,
+  ) -> Result<Value> {
+    self
+      .upload_backup_multipart(path, file_name, bytes, None)
+      .await
+  }
+
+  pub async fn upload_backup_multipart(
+    &self,
+    path: &str,
+    file_name: &str,
+    bytes: Vec<u8>,
+    master_key: Option<Vec<u8>>,
+  ) -> Result<Value> {
+    self
+      .upload_backup_multipart_with_setup_token(path, file_name, bytes, master_key, None)
+      .await
+  }
+
+  pub async fn upload_bootstrap_multipart(
+    &self,
+    path: &str,
+    file_name: &str,
+    bytes: Vec<u8>,
+    master_key: Option<Vec<u8>>,
+    setup_token: &str,
+  ) -> Result<Value> {
+    self
+      .upload_backup_multipart_with_setup_token(
+        path,
+        file_name,
+        bytes,
+        master_key,
+        Some(setup_token),
+      )
+      .await
+  }
+
+  async fn upload_backup_multipart_with_setup_token(
+    &self,
+    path: &str,
+    file_name: &str,
+    bytes: Vec<u8>,
+    master_key: Option<Vec<u8>>,
+    setup_token: Option<&str>,
+  ) -> Result<Value> {
+    let part = reqwest::multipart::Part::bytes(bytes)
+      .file_name(file_name.to_string())
+      .mime_str("application/octet-stream")?;
+    let mut form = reqwest::multipart::Form::new().part("file", part);
+    if let Some(key_bytes) = master_key {
+      let key_part = reqwest::multipart::Part::bytes(key_bytes)
+        .file_name("master.key")
+        .mime_str("application/octet-stream")?;
+      form = form.part("master_key", key_part);
+    }
+    if let Some(setup_token) = setup_token {
+      form = form.text("setup_token", setup_token.to_owned());
+    }
+    let mut request = self
+      .client
+      .request(Method::POST, format!("{}{}", self.base_url, path))
+      .multipart(form);
+    if let Some(token) = &self.token {
+      request = request.bearer_auth(token);
+    }
+    if let Some(csrf) = &self.csrf_token {
+      request = request.header("x-dopbase-csrf", csrf);
+    }
+    let response = request
+      .send()
+      .await
+      .map_err(|error| transport_error(error, &self.base_url, false))?;
+    let status = response.status();
+    let value: Value = response
+      .json()
+      .await
+      .context("server returned an invalid JSON response")?;
+    if !status.is_success() {
+      let errors = value
+        .get("error")
+        .and_then(Value::as_object)
+        .map(|errors| {
+          errors
+            .iter()
+            .map(|(code, message)| {
+              format!("{code}: {}", message.as_str().unwrap_or("Upload failed."))
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+        })
+        .unwrap_or_else(|| format!("server returned {status}"));
+      bail!(errors);
+    }
+    Ok(value.get("data").cloned().unwrap_or(Value::Null))
+  }
+
+  pub(crate) fn credential_token(&self) -> Result<&str> {
+    self
+      .token
+      .as_deref()
+      .context("Dopbase authentication is required")
+  }
+}
+
+fn transport_error(
+  error: reqwest::Error,
+  base_url: &str,
+  classify_availability: bool,
+) -> anyhow::Error {
+  let message = if error.is_timeout() {
+    format!(
+      "Dopbase at {base_url} did not respond within 30 seconds.\n\
+Check the server health and network connection, then try again."
+    )
+  } else if error.is_connect() {
+    format!(
+      "Could not connect to Dopbase at {base_url}.\n\
+Check that the server is running and verify the active endpoint with `dopbase client status`."
+    )
+  } else {
+    format!(
+      "The request to Dopbase at {base_url} failed before a response was received.\n\
+Check DNS, TLS, proxy, and network settings, then try again."
+    )
+  };
+  if classify_availability {
+    return AvailabilityError::new(message).into();
+  }
+  anyhow::anyhow!(message)
+}
+
+async fn read_limited_response(
+  mut response: reqwest::Response,
+  limit: u64,
+) -> Result<Vec<u8>> {
+  if response
+    .content_length()
+    .is_some_and(|length| length > limit)
+  {
+    bail!("server runtime response exceeded the maximum allowed size");
+  }
+  let mut body = Vec::new();
+  while let Some(chunk) = response.chunk().await? {
+    if body.len() as u64 + chunk.len() as u64 > limit {
+      bail!("server runtime response exceeded the maximum allowed size");
+    }
+    body.extend_from_slice(&chunk);
+  }
+  Ok(body)
+}
+pub fn credential(server: &ResolvedServer) -> Result<Credential> {
+  let credential = credential_from_sources(env::var(ENV_TOKEN), || session::load(server))?;
+  if credential.source != CredentialSource::None {
+    return Ok(credential);
+  }
+  #[cfg(unix)]
+  if let Some(session) = super::desktop_session::current(server)? {
+    return Ok(Credential {
+      token: Some(session.token),
+      csrf_token: Some(session.csrf_token),
+      source: CredentialSource::DesktopSession,
+      email: None,
+    });
+  }
+  Ok(credential)
+}
+
+#[doc(hidden)]
+pub fn credential_from_sources<F>(
+  environment: Result<String, env::VarError>,
+  saved: F,
+) -> Result<Credential>
+where
+  F: FnOnce() -> Result<Option<session::StoredSession>>,
+{
+  match environment {
+    Ok(token) => {
+      if token.is_empty() {
+        bail!("DOPBASE_TOKEN is set but empty");
+      }
+      return Ok(Credential {
+        token: Some(token),
+        csrf_token: None,
+        source: CredentialSource::Environment,
+        email: None,
+      });
+    }
+    Err(env::VarError::NotUnicode(_)) => bail!("DOPBASE_TOKEN contains invalid Unicode"),
+    Err(env::VarError::NotPresent) => {}
+  }
+  Ok(match saved()? {
+    Some(session) => Credential {
+      token: Some(session.token),
+      csrf_token: None,
+      source: CredentialSource::EncryptedSession,
+      email: session.email,
+    },
+    None => Credential {
+      token: None,
+      csrf_token: None,
+      source: CredentialSource::None,
+      email: None,
+    },
+  })
+}
+
+pub fn validate_runner_token(token: &str) -> Result<()> {
+  use crate::constants::tokens::RUNNER_TOKEN_PREFIX;
+
+  let encoded = token
+    .strip_prefix(RUNNER_TOKEN_PREFIX)
+    .context("Enter a Dopbase runner token beginning with dbs_.")?;
+  if encoded.len() != 43
+    || encoded
+      .bytes()
+      .any(|byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')))
+  {
+    bail!("Enter a valid Dopbase runner token.");
+  }
+  Ok(())
+}
+pub fn save_credential(
+  server: &ResolvedServer,
+  token: &str,
+  email: Option<&str>,
+) -> Result<()> {
+  session::save(server, token, email)
+}
+pub fn remove_credential(server: &ResolvedServer) -> Result<bool> {
+  session::remove(server)
+}
+pub async fn login(
+  server: &ResolvedServer,
+  save: bool,
+) -> Result<ApiClient> {
+  if !io::stdin().is_terminal() {
+    bail!("interactive login requires a terminal. Set DOPBASE_TOKEN for automation");
+  }
+  let (email, password) = prompt_login(server).await?;
+  let client = ApiClient::new(server, None)?;
+  let request = client.request(
+    Method::POST,
+    api::auth::LOGIN,
+    Some(json!({"email":email,"password":password,"sessionKind":"cli"})),
+  );
+  let data = tokio::select! {
+    result = request => result?,
+    signal = tokio::signal::ctrl_c() => {
+      signal?;
+      return Err(CliCancelled::Login.into());
+    }
+  };
+  let token = data
+    .get("token")
+    .and_then(Value::as_str)
+    .context("login response did not contain a token")?
+    .to_owned();
+  let email = data
+    .get("email")
+    .and_then(Value::as_str)
+    .context("login response did not contain an email")?;
+  if save {
+    save_credential(server, &token, Some(email))?;
+  }
+  ApiClient::new(server, Some(token))
+}
+
+async fn prompt_login(server: &ResolvedServer) -> Result<(String, String)> {
+  let server_url = server.url.clone();
+  let mut prompt = tokio::task::spawn_blocking(move || prompt_credentials(&server_url));
+  tokio::select! {
+    result = &mut prompt => result.context("login prompt task failed")?,
+    signal = tokio::signal::ctrl_c() => {
+      signal?;
+      let _ = tokio::time::timeout(Duration::from_millis(250), &mut prompt).await;
+      Err(CliCancelled::Login.into())
+    }
+  }
+}
+
+fn prompt_credentials(server_url: &str) -> Result<(String, String)> {
+  eprintln!("Dopbase login\nServer: {server_url}\n");
+  let email = prompt::email("Email:", CliCancelled::Login)?;
+  let password = prompt::password("Password:", false, CliCancelled::Login)?;
+  Ok((email, password))
+}
+
+pub fn normalize_login_email(value: &str) -> Result<String> {
+  crate::modules::common::validate_email(value)
+    .map_err(|_| anyhow::anyhow!("Enter a valid email address."))
+}
+pub(crate) enum HumanClient {
+  Existing(ApiClient),
+  NewlyAuthenticated(ApiClient),
+}
+
+pub(crate) async fn acquire_human_client(server: &ResolvedServer) -> Result<HumanClient> {
+  acquire_human_client_with_credential(server, credential(server)?).await
+}
+
+async fn acquire_human_client_with_credential(
+  server: &ResolvedServer,
+  credential: Credential,
+) -> Result<HumanClient> {
+  if credential.token.is_some() {
+    let client = ApiClient::from_credential(server, &credential)?;
+    if client
+      .request(Method::GET, api::auth::SESSION, None)
+      .await
+      .is_ok()
+    {
+      return Ok(HumanClient::Existing(client));
+    }
+    if credential.source == CredentialSource::Environment || !io::stdin().is_terminal() {
+      bail!("the configured Dopbase credential is invalid or expired");
+    }
+  }
+  login(server, true)
+    .await
+    .map(HumanClient::NewlyAuthenticated)
+}
+
+pub async fn human_client(server: &ResolvedServer) -> Result<ApiClient> {
+  Ok(match acquire_human_client(server).await? {
+    HumanClient::Existing(client) | HumanClient::NewlyAuthenticated(client) => client,
+  })
+}
+
+pub(crate) async fn metadata_client(server: &ResolvedServer) -> Result<ApiClient> {
+  use crate::constants::tokens::{ENVIRONMENT_AGENT_TOKEN_PREFIX, PROJECT_AGENT_TOKEN_PREFIX};
+  let credential = credential(server)?;
+  if credential.token.as_deref().is_some_and(|token| {
+    token.starts_with(crate::constants::tokens::AGENT_TOKEN_PREFIX)
+      || token.starts_with(ENVIRONMENT_AGENT_TOKEN_PREFIX)
+      || token.starts_with(PROJECT_AGENT_TOKEN_PREFIX)
+  }) {
+    return authenticated_client(server, credential);
+  }
+  Ok(
+    match acquire_human_client_with_credential(server, credential).await? {
+      HumanClient::Existing(client) | HumanClient::NewlyAuthenticated(client) => client,
+    },
+  )
+}
+
+pub(crate) async fn secret_writer_client(server: &ResolvedServer) -> Result<ApiClient> {
+  use crate::constants::tokens::{ENVIRONMENT_AGENT_TOKEN_PREFIX, PROJECT_AGENT_TOKEN_PREFIX};
+  let credential = credential(server)?;
+  if credential.token.as_deref().is_some_and(|token| {
+    token.starts_with(ENVIRONMENT_AGENT_TOKEN_PREFIX)
+      || token.starts_with(PROJECT_AGENT_TOKEN_PREFIX)
+  }) {
+    return authenticated_client(server, credential);
+  }
+  Ok(
+    match acquire_human_client_with_credential(server, credential).await? {
+      HumanClient::Existing(client) | HumanClient::NewlyAuthenticated(client) => client,
+    },
+  )
+}
+
+impl HumanClient {
+  pub(crate) fn client(&self) -> &ApiClient {
+    match self {
+      Self::Existing(client) | Self::NewlyAuthenticated(client) => client,
+    }
+  }
+
+  pub(crate) async fn confirm_plaintext_access(self) -> Result<ApiClient> {
+    match self {
+      HumanClient::NewlyAuthenticated(client) => Ok(client),
+      HumanClient::Existing(client) => {
+        let password = prompt_password_confirmation().await?;
+        let request = client.request(
+          Method::POST,
+          api::auth::REAUTHENTICATE,
+          Some(json!({"password":password})),
+        );
+        tokio::select! {
+          result = request => { result?; }
+          signal = tokio::signal::ctrl_c() => {
+            signal?;
+            return Err(CliCancelled::PasswordConfirmation.into());
+          }
+        }
+        Ok(client)
+      }
+    }
+  }
+}
+
+pub async fn recently_authenticated_client(server: &ResolvedServer) -> Result<ApiClient> {
+  if !io::stdin().is_terminal() {
+    bail!("interactive password confirmation is required for plaintext secret access");
+  }
+  acquire_human_client(server)
+    .await?
+    .confirm_plaintext_access()
+    .await
+}
+
+pub(crate) async fn export_client(server: &ResolvedServer) -> Result<ApiClient> {
+  use crate::constants::tokens::{
+    AGENT_TOKEN_PREFIX, ENVIRONMENT_AGENT_TOKEN_PREFIX, PROJECT_AGENT_TOKEN_PREFIX,
+    RUNNER_TOKEN_PREFIX,
+  };
+
+  let credential = credential(server)?;
+  match credential.token.as_deref() {
+    Some(token) if token.starts_with(RUNNER_TOKEN_PREFIX) => {
+      validate_runner_token(token)?;
+      return authenticated_client(server, credential);
+    }
+    Some(token) if token.starts_with(AGENT_TOKEN_PREFIX) => {
+      bail!("AI agents may access secret metadata but never secret values");
+    }
+    Some(token) if token.starts_with(ENVIRONMENT_AGENT_TOKEN_PREFIX) => {
+      bail!(
+        "environment-agent tokens can use secrets only through `dopbase run` and cannot export plaintext"
+      );
+    }
+    Some(token) if token.starts_with(PROJECT_AGENT_TOKEN_PREFIX) => {
+      bail!(
+        "project-agent tokens can use secrets through `dopbase run` and cannot export plaintext"
+      );
+    }
+    _ => {}
+  }
+  if !io::stdin().is_terminal() {
+    bail!("interactive password confirmation is required for plaintext secret access");
+  }
+  acquire_human_client_with_credential(server, credential)
+    .await?
+    .confirm_plaintext_access()
+    .await
+}
+
+pub(crate) async fn ensure_recent_authentication(client: &ApiClient) -> Result<()> {
+  let session = client
+    .request(Method::GET, api::auth::SESSION, None)
+    .await?;
+  let recent = session
+    .get("recentAuthentication")
+    .and_then(Value::as_bool)
+    .context("session response did not contain recent-authentication status")?;
+  if recent {
+    return Ok(());
+  }
+  if !io::stdin().is_terminal() {
+    bail!(
+      "recent human authentication is required. Run this command in a terminal to confirm your password"
+    );
+  }
+  let password = prompt_password_confirmation().await?;
+  client
+    .request(
+      Method::POST,
+      api::auth::REAUTHENTICATE,
+      Some(json!({"password":password})),
+    )
+    .await?;
+  Ok(())
+}
+
+async fn prompt_password_confirmation() -> Result<String> {
+  eprintln!("Password confirmation required.");
+  let mut prompt = tokio::task::spawn_blocking(|| {
+    prompt::password("Password:", false, CliCancelled::PasswordConfirmation)
+  });
+  tokio::select! {
+    result = &mut prompt => result.context("password confirmation prompt task failed")?,
+    signal = tokio::signal::ctrl_c() => {
+      signal?;
+      let _ = tokio::time::timeout(Duration::from_millis(250), &mut prompt).await;
+      Err(CliCancelled::PasswordConfirmation.into())
+    }
+  }
+}
+pub async fn any_authenticated_client(server: &ResolvedServer) -> Result<ApiClient> {
+  let credential = credential(server)?;
+  authenticated_client(server, credential)
+}
+
+#[doc(hidden)]
+pub fn authenticated_client(
+  server: &ResolvedServer,
+  credential: Credential,
+) -> Result<ApiClient> {
+  if credential.token.is_some() {
+    return ApiClient::from_credential(server, &credential);
+  }
+  bail!("Dopbase authentication is required. Run `dopbase login` first or set DOPBASE_TOKEN.")
+}

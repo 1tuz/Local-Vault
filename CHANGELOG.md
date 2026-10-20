@@ -1,0 +1,604 @@
+# Changelog
+
+All notable changes to Dopbase are documented in this file.
+
+## 0.1.9 - 2026-10-07
+
+[Dopbase](https://dopbase.com) 0.1.9 adds guided server setup, optional web UI,
+background server management, terminal secret editing, and runner exports for
+pipelines. AI agent tokens can read CLI metadata. Run token arguments, legacy
+server commands, and some setup responses change in this release.
+
+### Added
+
+- Runner tokens can export their assigned environment with `dopbase export`,
+  using `DOPBASE_TOKEN` or an encrypted credential saved by `login --token`.
+  Pipeline exports need no terminal or password prompt and require a live server
+  response. Export formats, private files, and overwrite protection remain
+  unchanged. Added an AWS CodeBuild example using Secrets Manager.
+
+- `dopbase env edit <ENVIRONMENT_REF>` opens an environment in Vim, Neovim,
+  Helix, nano, or a custom terminal editor. It checks the target before password
+  confirmation and offers to add secrets when an environment is empty. It
+  validates edits, previews key changes, removes editor files, and saves only
+  after confirmation. Prints "Checking changes..." and "Saving..." while
+  waiting for the server.
+  Comments and ordering persist across CLI and UI sessions. `--editor` selects
+  a command and `--dry-run` previews without saving. Protected editor profiles,
+  private files, revision checks, and session cleanup reduce plaintext exposure.
+  Custom commands require acknowledgement; comments remain unencrypted metadata.
+
+- Disable the web UI with `web_ui = false` in `server.toml`,
+  `DOPBASE_WEB_UI=false`, or `server start --no-web-ui`. It stays enabled by
+  default. CLI and REST API access remain available, and API documentation uses
+  its own setting. Background restart preserves launch overrides.
+  `server setup --web` explicitly enables the UI for that run without changing
+  saved configuration.
+
+- `DOPBASE_ROOT_EMAIL` supplies the root email for `server setup`, with explicit
+  `--email` taking precedence. CLI setup generates a password without prompts;
+  web setup includes the email in its link and prefills the editable form.
+  `server setup --web --email` is now supported. Invalid email defaults fail
+  before setup writes files. On fresh `server start`, the variable creates root
+  with a generated password shown once; initialized startup ignores it.
+
+- `dopbase server setup` initializes a local instance through guided root-account
+  prompts or `--email` with a generated password shown once. `--json` supports
+  generated-password setup. `server setup --web` runs the existing web claim
+  and backup-restoration flow.
+
+- `dopbase server start --background` (or `-b`) starts a managed background
+  server. `server restart` restarts it with the saved CLI and server environment
+  overrides while rereading configuration.
+
+- Server startup now creates missing server and client configuration files with
+  commented examples for every supported setting. Client saves include the
+  reference above active settings.
+
+- Community discussion forms, starter tutorials with verified CLI output, and
+  links from the README, documentation, and issue chooser.
+- A discussion publication manifest and a maintainer checklist for categories,
+  pins, and the first month of community follow-up.
+
+### Improvement
+
+- Linux and macOS release downloads use tar.gz archives with gzip level 9.
+  Release steps run through tested Bash scripts, cache dependencies, and support
+  a manual build run without publishing. Releases stay drafts until uploads are
+  verified; reruns preserve published assets.
+
+- The public shell installer shows download progress, verifies SHA-256, and
+  checks the new binary with `--version` before replacing an existing install.
+  It reports the installed path and current server commands. It requires
+  tar/gzip and supports tar.gz releases only.
+
+- `dopbase env list` and the list printed after `env clone` show a single
+  `ENVIRONMENT` column with `project/environment` values. IDs, update times,
+  and JSON output keep their existing format.
+
+- CLI tests now cover every public command and subcommand, with shared fixtures
+  for real server and terminal workflows. Removed repeated cases and duplicate
+  backend test runs.
+
+- `server start` initializes fresh instances automatically through the existing
+  protected web setup flow or a root email with generated credentials. Foreground
+  and background modes keep serving after setup. Background credentials return
+  only to the launching command, including an optional `setup` object in JSON.
+  Disabled UI settings are respected; interrupted factory resets still require
+  explicit setup. Credential-output failure stops the new server and preserves
+  the initialized account for offline password recovery.
+
+### Security
+
+- Runner exports enforce environment scope and record the runner token ID and
+  secret count in the audit log without secret values. Human password
+  confirmation, browser CSRF checks, and AI agent restrictions remain in place.
+
+### Note
+
+- **Breaking:** Removed `dopbase run -t <TOKEN>` and `--token <TOKEN>`.
+  Inject `DOPBASE_TOKEN` through a CI secret store or deployment platform, or
+  save a runner credential with `dopbase login --token`. Authentication now
+  resolves `DOPBASE_TOKEN`, then the encrypted saved credential. An invalid
+  environment credential never falls back to saved credentials. Arguments
+  after `--` still belong to the child command.
+
+- **Breaking:** With the web UI disabled and no bootstrap root email, background
+  startup with `--json` writes
+  `success = false` and `info.code = "SETUP_REQUIRED"` to stdout, replacing
+  `error.SETUP_REQUIRED` on stderr. The notice includes `message`, `data_dir`,
+  and `config_file`. Update scripts that read the previous response.
+
+- Existing initialized installations preserve accounts and credentials. No
+  database migration is required. Explicit terminal setup, web setup, and backup
+  restoration keep their existing behavior. `dopbase init` retains its project
+  and environment workflow.
+
+- **Breaking:** `dopbase server up` and `dopbase server down` have been replaced by
+  `server start --background` or `server start -b` and `server stop`.
+  The old commands show an informational migration notice and exit with
+  status 1 without changing server state. JSON mode returns `COMMAND_REPLACED`
+  information on stdout. Servers started before this change need one manual
+  stop/start before restart is available. Update scripts that use the previous commands.
+
+### Fixed
+
+- AI agent tokens now work with `project list`, `project show`, `env list`,
+  `env show`, `secret list`, and `secret get` without `--reveal`. Metadata reads
+  validate the token through the API instead of requiring a human session.
+  Invalid, expired, and revoked tokens fail without falling back to saved
+  credentials. Secret values and writes remain restricted.
+
+- CLI documentation now lists the `env edit` fallback order correctly:
+  `nvim`, `vim`, `hx`, then `nano`.
+
+- Secret exports include values, layout, and a revision from one snapshot.
+  Imports check supplied revisions during dry runs as well as apply, protecting
+  edits from concurrent changes. Layout imports reject slots containing values.
+  CLI response buffers are cleared after parsing, and exported JSON values are
+  moved out of the response instead of copied.
+
+- Background startup shows the short `dopbase server stop` and
+  `dopbase server restart` commands. JSON output includes both
+  `stop_command` and `restart_command`.
+
+- Direct invocation of the internal supervised server mode no longer claims a
+  runtime-owned file descriptor. Readiness reporting attaches only to an
+  inherited write pipe, preventing reactor failures during startup rejection.
+
+- Remote CLI exports now send an explicit content length for empty POST
+  requests, avoiding HTML errors from hosts that require it. The fix also
+  applies to other CLI commands that send empty POST requests.
+- CLI errors now report the HTTP status when a server returns a non-JSON error
+  response.
+
+## 0.1.8 - 2026-09-26
+
+[Dopbase](https://dopbase.com) 0.1.8 adds configurable expiry for runner and AI agent tokens and a CLI
+command to clone an environment's secrets. Interactive `dopbase run` commands
+now keep terminal input, and the Admin UI shows token expiry and clearer audit
+details.
+
+### Added
+
+- Runner and AI agent tokens can now expire after a chosen number of hours or
+  days, up to three years, or have no expiry. The Admin UI offers preset and
+  custom durations; `dopbase token create` accepts `--expires-in`.
+- `dopbase env clone PROJECT/ENVIRONMENT NEW_NAME` creates an environment in
+  the same project and copies its current secrets without a temporary file.
+
+### Improvement
+
+- Secrets table rows now brighten on hover, and expanded audit events show their raw timestamp.
+- Grouped the Users page controller's values and functions into `state` and
+  `actions` to simplify its page setup.
+- Added fix inconsistent width layout on frontend.
+- Documentation now reads the current version from `package.json` during builds
+  instead of keeping release numbers in individual pages.
+- Documentation checks now run from one script and validate every Mermaid
+  diagram under `docs`.
+
+### Fixed
+
+- UI controller tests now run unmount hooks inside component setup, removing
+  lifecycle warnings from the test run.
+- Token tests no longer print credential-bearing API responses on assertion failures.
+- The AI agents list now shows each token's expiry date or "No expiry".
+- `dopbase run` now keeps interactive commands attached to the terminal, so
+  tools such as Codex and Claude accept input instead of stopping at startup.
+
+### Note
+
+- Existing runner tokens remain without expiry. New runner tokens also have no
+  expiry unless one is set. AI agent tokens still default to 30 days.
+- The repository's `scripts/install.sh` helper was removed. Use the installer
+  at `https://dopbase.com/install.sh`.
+
+## 0.1.7 - 2026-09-20
+
+[Dopbase](https://dopbase.com) 0.1.7 adds guided `.env` setup, TOML secret files, and Docker-ready
+exports. It also refreshes the Admin UI branding, demo assets, and contributor
+documentation.
+
+### Added
+
+- Added TOML support for `dopbase init`, `dopbase import`, and
+  `dopbase export`, including `.toml` filename detection and `--format toml`.
+- Added an interactive `dopbase init` flow that reads `./.env`, checks the
+  active server and login, summarizes detected variables, creates a new project
+  and environment, and asks whether to delete the imported file.
+- Added Docker, JSON, YAML, and dotenv export formats.
+- Added `dopbase export project/env --format docker --stdout` for explicit
+  output format selection.
+- Added an export-only Docker format for passing secrets to `docker run` or
+  `docker exec` through `--env-file` without dotenv quotes changing values.
+- Added web-ready MP4 and GIF versions of the Dopbase demo, including three
+  video sizes, a short forum preview, and a README Demo section with a GIF
+  preview and full video download.
+- Added a Contributor Covenant 3.0 Code of Conduct with a private reporting
+  process and enforcement guidelines.
+
+### Improvement
+
+- Reformatted CLI help constants as multiline strings so examples are easier to
+  edit.
+- Automatic hide when user want to update token while secrets revealed.
+- Removed third-party attribution from Admin UI source comments and design
+  token documentation so the interface is described as Dopbase's own system.
+- The Admin UI now uses the updated Dopbase mark in authentication, navigation,
+  and not-found screens.
+- Bun scripts now use `action:target` names for development, builds, tests,
+  linting, type checks, formatting checks, and previews.
+- Backend release verification now discovers the CLI command tree from the
+  built binary and checks both supported help forms for every command.
+- The README now includes the complete top-level CLI reference, environment
+  variables, and common startup examples.
+- Removed duplicate frontend and backend tests while preserving behavior
+  coverage.
+
+## 0.1.6 - 2026-09-12
+
+[Dopbase](https://dopbase.com) 0.1.6 adds JSON and YAML secret files, runtime cache maintenance, and
+consistent project and environment references across the CLI and Admin UI.
+
+### Added
+
+- `dopbase init`, `dopbase secret import`, and `dopbase secret export` support
+  dotenv, JSON, and YAML files. File extensions select the format automatically,
+  or `--format` can set it explicitly.
+- `dopbase cache list` shows safe metadata for the active server's encrypted
+  runtime cache.
+- `dopbase cache clean` removes entries older than 14 days by default, with
+  options for a different age, a dry run, or complete cleanup.
+
+### Improvement
+
+- `dopbase init` now accepts one `PROJECT_NAME/ENVIRONMENT_NAME` target.
+- `dopbase env create` now accepts one `PROJECT_REF/ENVIRONMENT_NAME` target.
+  The previous two-argument forms are no longer accepted.
+- Environment references can use an environment ID or an environment name
+  qualified by either a project name or project ID.
+- CLI usage and help now distinguish new resource names from references to
+  existing resources.
+- Server startup and update errors now give more specific recovery steps.
+
+### Fixed
+
+- The Admin UI now keeps project and environment selection in the URL, and row
+  actions no longer select the item underneath them.
+- Expired browser sessions now show a sign-in prompt instead of repeatedly
+  sending requests with an expired CSRF token.
+
+## 0.1.5 - 2026-09-11
+
+Dopbase now supports more self-hosted connection formats, creates a recovery
+archive before host-side factory resets, and uses clearer copy across the CLI,
+Admin UI, API documentation, and public guides.
+
+### Added
+
+- `dopbase client connect` accepts explicit HTTP URLs and bare IPv4 or IPv6
+  addresses with optional ports. Bare IP addresses use HTTP by default.
+- `dopbase admin factory-reset` saves the complete data directory as a ZIP
+  before removing it. Pass `--no-backup` to reset without creating the archive.
+
+### Improvement
+
+- `dopbase run -t <TOKEN>` is now a short form of `--token <TOKEN>`.
+- `dopbase -v` now prints the installed version as `v<version>`. The existing
+  `-V` and `--version` flags use the same output.
+- CLI errors, prompts, and help text provide clearer recovery steps and use
+  consistent terms.
+- Frontend copy, OpenAPI descriptions, source comments, and public
+  documentation use shorter, more direct language.
+
+### Security
+
+- The CLI warns before connecting over HTTP because the transport does not
+  protect credentials or secrets. HTTPS remains the recommended protocol.
+
+## 0.1.3 - 2026-09-09
+
+Dopbase 0.1.3 improves CLI output and credential handling, keeps API routes in
+one shared catalog, expands the AI agent documentation, and trims release
+dependencies.
+
+### Improvement
+
+- CLI list and detail commands now use readable tables, labeled fields, and
+  concise result messages by default. `--json` keeps the existing
+  machine-readable response shapes.
+- Password and secret prompts show masked input. Interactive
+  `dopbase secret set --stdin` explains how to finish entering a value, while
+  piped input remains unchanged.
+- `dopbase login --token` can save a runner token in the encrypted local
+  credential store. `dopbase run --token <TOKEN>` provides a one-off override.
+- Backend route paths now come from one shared catalog used by the server,
+  OpenAPI annotations, and CLI requests.
+- OpenAPI labels and metadata are clearer, and wide documentation tables can be
+  expanded for easier reading.
+- Added guides for AI agent access and supported environment variables.
+- Reduced application dependencies and tightened release build settings.
+
+### Security
+
+- Runtime authentication now resolves `--token`, then `DOPBASE_TOKEN`, then
+  the saved credential. Command-line tokens remain intended for one-off use
+  because process inspection and shell history may expose them.
+
+## 0.1.2 - 2026-09-09
+
+[Dopbase](https://dopbase.com) 0.1.2 adds an offline, root-authorized factory reset, switches new
+environments to short random IDs, removes native Windows packaging, and
+standardizes pull request and release notes.
+
+### Improvement
+
+- Added `dopbase admin factory-reset` for root-authorized, offline instance
+  resets from the server host.
+- New environments receive random six-digit IDs such as `env_482731`. Existing
+  IDs continue to work.
+- The Admin UI shows the selected environment ID with a copy button and focuses
+  the name field when a project or environment dialog opens.
+- `dopbase server logs --watch` and `-w` replace `--follow` and `-f`. The old
+  flags are no longer accepted.
+- Pull request descriptions now follow a checked repository template. Release
+  notes use the matching changelog section and link to the complete comparison
+  between versions.
+
+### Note
+
+- Removed native Windows release archives and the PowerShell installer. Windows
+  users must run Dopbase in a Linux container with Docker.
+
+## 0.1.1 - 2026-09-08
+
+### Added
+
+- Added `dopbase server logs` for reading, following, and clearing background
+  server output.
+- Added command-specific help and examples when required CLI arguments or
+  subcommands are missing.
+- Published a CLI cheat sheet, architecture documentation, and monthly public
+  security summaries.
+
+### Changed
+
+- Moved local server commands under `dopbase server`: `start` runs in the
+  foreground, while `up`, `down`, `status`, and `logs` manage a background
+  server. The old `serve`, `serve --background`, and `stop` commands are no
+  longer supported.
+- Fixed the SQLite database location at `<data-dir>/dopbase.db` and replaced
+  `--bind-address` and `--database-url` with separate host and port settings.
+  The matching legacy configuration keys and environment variables are no
+  longer supported.
+- Updated the command reference and examples for the new server commands and
+  made wide documentation tables scroll on smaller screens.
+
+### Fixed
+
+- Prevented server status checks from creating missing database or lock files.
+
+### Security
+
+- Required HTTPS for remote client and public server URLs while keeping HTTP
+  available for loopback addresses. Client requests no longer follow redirects.
+- Rate-limited password re-verification, restricted post-login redirects to
+  same-origin paths, and removed deleted secret data from SQLite files after
+  restores and factory resets.
+- Added content security, frame, content-type, referrer, and API cache-control
+  response headers.
+
+## 0.1.0 - 2026-09-06
+
+### Added
+
+- Static root/admin/member permissions, browser-based user administration,
+  metadata-only AI service accounts with expiring bearer tokens, and the
+  authenticated `/api/v1/status` summary.
+- Console user-role selection, AI account creation/deletion, instance counts,
+  and root-only Danger Zone visibility.
+- User guides for account management, role permissions, instance status,
+  and factory-reset confirmations.
+
+### Changed
+
+- Replaced the boxed server startup banner with plain startup lines and
+  updated documentation examples to match.
+
+## 0.0.15 - 2026-09-06
+
+### Added
+
+- Admin UI component system with solid borderless buttons, filled fields with
+  inline labels, borderless badges, and new toggle and checkbox primitives,
+  all using the Dopbase purple accent.
+- The "Edit as .env" view is now a full editor shell with a filename tab and
+  unsaved-changes dot, active-line gutter highlight, a status bar with cursor
+  position and problem counts, a problems strip, and Cmd/Ctrl+S to save.
+
+### Fixed
+
+- Equalized `DbInput` and `DbSelect` field heights.
+- Selecting a project now reliably opens its first environment instead of
+  getting stuck on a stale environment left over from the previous project.
+
+## 0.0.14 - 2026-09-05
+
+### Added
+
+- Encrypted backup creation, upload, download, deletion, and restoration through
+  the Admin UI, REST API, and CLI.
+- First-run disaster recovery from a backup archive using the one-time setup
+  token and the source server's master key.
+- An encrypted, server-scoped CLI run cache for explicitly requested offline
+  secret injection.
+
+### Changed
+
+- Rekey cross-server backup imports to the target server's master key while
+  preserving secret values and the active administrator session.
+- Expanded backup, restore, storage, audit, and CLI documentation, including a
+  dedicated disaster-recovery guide.
+- Simplified frontend and binary build command names and refreshed the repository
+  banner.
+
+### Security
+
+- Validate backup authentication, manifests, SQLite integrity, schema migrations,
+  archive sizes, and setup authorization before modifying live data.
+- Apply restores through disposable database connections so cancellation cannot
+  return unsafe connection state to the application pool.
+
+## 0.0.13 - 2026-09-04
+
+### Added
+
+- Encrypted, server-scoped CLI sessions with cached identity metadata and safe
+  offline status reporting.
+- Server-scoped default environments for `dopbase run`, with explicit argument
+  and `DOPBASE_ENV` precedence.
+- Single-instance server locking and branded foreground and background startup
+  banners.
+
+### Changed
+
+- Made server switching validate and confirm the destination, coordinate with
+  matching local servers, and clear obsolete sessions and environment defaults.
+- Required interactive password confirmation before CLI secret reveal and export
+  operations return plaintext values.
+- Refreshed Dopbase branding, CLI documentation, and frontend/backend build
+  commands.
+
+## 0.0.12 - 2026-09-01
+
+### Added
+
+- Revision-protected secret import previews that reject stale replace operations.
+- Windows x64 release archives and a checksum-verifying PowerShell installer.
+- Session-history retention with automatic cleanup after 30 days.
+
+### Changed
+
+- Serialized concurrent secret writes and token revocations so versions and audit
+  records remain consistent.
+- Made project, environment, authentication, and audit mutations transactional.
+- Moved password hashing and verification to bounded blocking workers.
+- Hardened daemon PID ownership, private-file writes, and rate-limiter storage.
+- Cancelled stale Admin UI requests and queued concurrent reauthentication work.
+- Expanded release verification across Linux, macOS, and Windows artifacts.
+
+## 0.0.8 - 2026-08-30
+
+### Added
+
+- Configurable server host and port through CLI flags, `server.toml`, and
+  environment variables, including automatic public URL derivation for
+  loopback addresses.
+- Background server operation with PID and log files, graceful shutdown via
+  `dopbase stop`, stale PID cleanup, and startup failure reporting.
+- Informational `dopbase update` checks for newer GitHub releases.
+- Configuration and CLI controls for enabling the Swagger UI and OpenAPI
+  document when required.
+- A dedicated Admin UI page for reviewing imported secrets.
+
+### Changed
+
+- The default server port is now **8840** instead of 8376.
+- Swagger UI and OpenAPI documents are disabled by default.
+- Expanded generated endpoint documentation and moved HTTP error coverage into
+  integration tests.
+- Refined workspace and dialog presentation throughout the Admin UI.
+- Streamlined backend dependencies and adopted shared Rust formatting rules.
+
+## 0.0.7 - 2026-08-29
+
+### Added
+
+- Public documentation for CLI commands, REST API endpoints, security,
+  encryption keys, backups, audit events, and troubleshooting.
+- Operational guides for installation, configuration, project workflows, and
+  self-hosting.
+- Initial release changelog and project branding.
+
+### Changed
+
+- Updated the roadmap, open-source status, development guidance, and usage
+  documentation to reflect the implemented v0.1 command and API surface.
+
+## 0.0.6 - 2026-08-29
+
+### Added
+
+- Complete Admin UI routing and boot flow with authentication and dashboard
+  layouts.
+- Instance setup, administrator login, account and session management, audit
+  events, and instance status screens.
+- Project and environment navigation with secret and runner token management.
+- Dotenv parsing, syntax highlighting, import/export workflows, and environment
+  file editing.
+- Typed frontend API clients, session state, reauthentication flows, shared UI
+  components, and application icons.
+- Frontend tests covering authentication, workspace workflows, secret
+  management, dotenv handling, formatting, and HTTP behavior.
+
+### Changed
+
+- Replaced the starter interface with the Dopbase design theme and application
+  shell.
+
+## 0.0.5 - 2026-08-29
+
+### Added
+
+- CLI commands for serving Dopbase and managing authentication, projects,
+  environments, secrets, and runner tokens.
+- A CLI API client, local client configuration, and dotenv parsing and
+  serialization.
+- End-to-end backend workflow and application verification tests.
+- The composed Dopbase binary and supporting database service integration.
+
+## 0.0.4 - 2026-08-29
+
+### Added
+
+- Versioned REST API modules for health checks, authentication, instance
+  bootstrap, projects, environments, secrets, runner tokens, audit events, and
+  instance status.
+- Contracts, validation errors, persistence, business logic, HTTP handlers,
+  OpenAPI schemas, and route assembly for each API module.
+
+## 0.0.3 - 2026-08-29
+
+### Added
+
+- Layered server configuration with shared constants, resource limits, error
+  codes, and token prefixes.
+- Authentication extractors, secure token utilities, request rate limiting,
+  envelope encryption, and shared audit recording.
+- Stable HTTP response envelopes and error responses.
+- Shared authentication, resource, and secret models.
+- Application state, server lifecycle management, router composition, and an
+  embedded fallback UI.
+
+## 0.0.2 - 2026-08-29
+
+### Added
+
+- Cross-platform release automation and a release installer for Linux and
+  macOS on x64 and ARM64.
+- Installer tests, a backend test container, and a combined development runner.
+- Initial database migrations for instance metadata, administrators, sessions,
+  projects, environments, secrets, runner tokens, audit events, and environment
+  layouts.
+- Migration operation documentation and the v0.1 implementation roadmap.
+
+## 0.0.1 - 2026-08-28
+
+### Added
+
+- Initial Rust backend and Vue Admin UI project scaffold.
+- Project README, contribution guidelines, license, security policy, and legal
+  notices.
+- Initial public documentation site, product boundaries, roadmap, CLI and API
+  plans, self-hosting guidance, and reference documentation.

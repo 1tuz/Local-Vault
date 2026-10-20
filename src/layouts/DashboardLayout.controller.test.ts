@@ -1,0 +1,85 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { createPinia, setActivePinia } from "pinia";
+import { useDashboardLayoutController } from "./DashboardLayout.controller";
+import * as authApi from "~/services/auth.api";
+import { ApiError } from "~/services/http.client";
+import { useAuthStore } from "~/stores/auth.store";
+import { browserSession } from "~/tests/browser-session";
+
+const { routerPush, routerReplace, route } = vi.hoisted(() => ({
+  routerPush: vi.fn(),
+  routerReplace: vi.fn(),
+  route: { fullPath: "/projects/p/billing/e/env_1" },
+}));
+
+vi.mock("vue-router", () => ({
+  useRoute: () => route,
+  useRouter: () => ({ push: routerPush, replace: routerReplace }),
+}));
+
+vi.mock("~/services/auth.api");
+
+beforeEach(() => {
+  setActivePinia(createPinia());
+  routerPush.mockReset();
+  routerReplace.mockReset();
+  sessionStorage.clear();
+});
+
+async function loginAdmin(): Promise<void> {
+  vi.mocked(authApi.login).mockResolvedValueOnce(browserSession());
+  await useAuthStore().login("a@b.c", "pw");
+}
+
+describe("useDashboardLayoutController", () => {
+  it("exposes the signed-in email", async () => {
+    await loginAdmin();
+    const c = useDashboardLayoutController();
+    expect(c.email.value).toBe("a@b.c");
+  });
+
+  it("logs out and routes to the login screen with loggingOut state", async () => {
+    await loginAdmin();
+    let resolveLogout!: () => void;
+    const logoutPromise = new Promise<void>((resolve) => {
+      resolveLogout = resolve;
+    });
+    vi.mocked(authApi.logout).mockReturnValueOnce(logoutPromise);
+    const c = useDashboardLayoutController();
+    expect(c.loggingOut.value).toBe(false);
+    const callPromise = c.logout();
+    expect(c.loggingOut.value).toBe(true);
+    resolveLogout();
+    await callPromise;
+    expect(c.loggingOut.value).toBe(false);
+    expect(authApi.logout).toHaveBeenCalledTimes(1);
+    expect(routerPush).toHaveBeenCalledWith({ name: "login" });
+    expect(useAuthStore().isAuthenticated).toBe(false);
+  });
+
+  it("still routes to login when the logout API fails", async () => {
+    await loginAdmin();
+    vi.mocked(authApi.logout).mockRejectedValueOnce(
+      new ApiError(403, {
+        AUTHORIZATION_DENIED: "A valid CSRF token is required.",
+      }),
+    );
+    const c = useDashboardLayoutController();
+    await expect(c.logout()).resolves.toBeUndefined();
+    expect(routerPush).toHaveBeenCalledWith({ name: "login" });
+    const store = useAuthStore();
+    expect(store.session).toBeNull();
+    expect(store.csrfToken).toBeNull();
+  });
+
+  it("returns to the interrupted page after signing in again", async () => {
+    const c = useDashboardLayoutController();
+
+    await c.signInAgain();
+
+    expect(routerReplace).toHaveBeenCalledWith({
+      name: "login",
+      query: { redirect: "/projects/p/billing/e/env_1" },
+    });
+  });
+});

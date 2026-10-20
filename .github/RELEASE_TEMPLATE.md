@@ -1,0 +1,5 @@
+## Summary
+
+{{SUMMARY}}
+
+{{OPTIONAL_SECTIONS}}{{FULL_CHANGELOG}}

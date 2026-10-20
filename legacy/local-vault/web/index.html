@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="color-scheme" content="light dark" />
+<title>Local Vault</title>
+<link rel="stylesheet" href="/style.css" />
+<script src="/app.js" defer></script>
+</head>
+<body>
+  <main id="authScreen" class="auth-screen hidden">
+    <button type="button" class="btn ghost auth-theme-button" id="authThemeBtn"><span data-icon="moon"></span><span id="authThemeLabel">Тёмная тема</span></button>
+    <section class="auth-card">
+      <div class="mark large" data-icon="vault"></div>
+      <div class="eyebrow">LOCAL / ENCRYPTED</div>
+      <h1>Ваши секреты.<br>Только на вашем устройстве.</h1>
+      <p class="muted">Локальная база с шифрованием AES-256-GCM и историей изменений. Без облака и учётных записей.</p>
+      <form id="authForm">
+        <label for="masterPassword">Мастер-пароль</label>
+        <input id="masterPassword" type="password" autocomplete="current-password" minlength="12" required placeholder="Введите пароль" />
+        <div id="confirmRow" class="hidden"><label for="confirmPassword">Повторите пароль</label><input id="confirmPassword" type="password" autocomplete="new-password" placeholder="Повторите пароль" /></div>
+      <button type="submit" id="authSubmit" class="btn primary wide">Открыть хранилище <span data-icon="arrow-right"></span></button>
+      </form>
+      <p id="authHint" class="auth-note">Понадобится мастер-пароль. Восстановления через сервис нет.</p>
+      <p id="authError" class="error hidden" role="alert"></p>
+    </section>
+    <footer class="auth-footer">LOCAL VAULT • OFFLINE BY DESIGN</footer>
+  </main>
+
+  <main id="vaultScreen" class="app-shell hidden">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="mark" data-icon="vault"></div>
+        <div><strong>Local Vault</strong><span>Локальное хранилище</span></div>
+      </div>
+      <div class="sidebar-label">РАЗДЕЛЫ</div>
+      <nav id="navCategories" aria-label="Типы записей"></nav>
+      <div class="sidebar-separator"></div>
+      <div class="sidebar-label">УПРАВЛЕНИЕ</div>
+      <button type="button" class="nav-action" id="importBtn"><span class="icon-slot" data-icon="import"></span> Импорт YAML / JSON</button>
+      <button type="button" class="nav-action" id="exportBtn"><span class="icon-slot" data-icon="export"></span> Экспорт хранилища</button>
+      <button type="button" class="nav-action" id="auditBtn"><span class="icon-slot" data-icon="audit"></span> Журнал операций</button>
+      <div class="sidebar-bottom"><div class="status-pill"><i></i> Хранилище открыто</div><button type="button" class="nav-action" id="lockBtn"><span class="icon-slot" data-icon="lock"></span> Заблокировать</button></div>
+    </aside>
+
+    <section class="workspace">
+      <header class="toolbar">
+        <div class="breadcrumbs">ЛОКАЛЬНОЕ ХРАНИЛИЩЕ <span>/</span> <strong id="sectionName">Все записи</strong></div>
+        <div class="toolbar-actions"><button type="button" class="icon-button" id="themeBtn" title="Переключить тему" aria-label="Сменить тему"><span data-icon="theme"></span></button><button type="button" class="btn primary" id="newBtn">+ Новая запись</button></div>
+      </header>
+      <div class="page-area">
+        <section class="list-pane">
+          <div class="list-heading"><div class="eyebrow">ВАША БАЗА</div><h1 id="pageTitle">Все записи</h1><p class="muted">Зашифровано на устройстве. Секреты не показываются в списке.</p></div>
+          <label class="searchbox"><span data-icon="search"></span><input type="search" id="searchInput" autocomplete="off" placeholder="Поиск по имени и папке" /></label>
+          <div class="list-count"><span id="countLabel">ЗАПИСИ · 0</span><span>ТИП / ВЕРСИЯ</span></div>
+          <div id="entryList" class="entry-list"></div>
+        </section>
+        <section class="detail-pane" id="detailPane">
+          <div class="blank-state"><div class="blank-symbol" data-icon="vault"></div><h2>Выберите запись</h2><p>Содержимое доступно только после открытия записи в этой панели.</p></div>
+        </section>
+      </div>
+    </section>
+  </main>
+  <input id="importInput" type="file" accept=".yaml,.yml,.json,text/yaml,application/json" hidden />
+  <div id="toast" class="toast hidden" role="status"></div>
+</body>
+</html>

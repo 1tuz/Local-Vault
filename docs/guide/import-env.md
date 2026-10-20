@@ -1,0 +1,134 @@
+---
+title: "Import and export secret files"
+description: "Import dotenv, JSON, YAML, or TOML files, and export secrets for files or Docker."
+---
+
+# Import and export secret files
+
+Dopbase accepts dotenv, JSON, YAML, and TOML files. It parses each file into
+individual secret records instead of storing the file as one opaque object.
+
+## Create a project from a secret file
+
+Use `init` when the project does not exist yet:
+
+```bash
+dopbase init
+dopbase init payment-service/development --from .env
+dopbase init another-service/development --from secrets.json
+dopbase init worker/development --from secrets.yaml
+dopbase init worker/development --from secrets.toml
+```
+
+With no arguments, `init` reads `./.env`, shows how many variables it found,
+and asks for a `project/environment` target. Its sensitive count is based only
+on variable names. Dopbase never prints the values, and it imports every
+variable regardless of that count.
+
+The file is validated first. Dopbase then creates the project, environment,
+and individual secret records atomically. If validation or creation fails, no
+partial project remains. After an interactive import, the command asks whether
+to delete `.env`, with Yes selected by default. It keeps the file if its
+contents changed during the import and does not edit `.gitignore`.
+
+`init` fails if the project name already exists. To add another environment to
+that project, create it explicitly and import into it:
+
+```bash
+dopbase env create payment-service/staging
+dopbase import payment-service/staging .env.staging
+```
+
+## Update an existing environment
+
+Import merges by default:
+
+```bash
+dopbase import payment-service/staging .env.staging
+```
+
+Keys in the file are created or updated. Existing remote keys that are absent
+from the file remain unchanged. Preview the operation without making changes:
+
+```bash
+dopbase import payment-service/staging .env.staging --dry-run
+```
+
+Use `--replace` only when the environment should exactly match the file.
+Dopbase shows which keys would be deleted and requires confirmation or `--yes`.
+
+Dotenv input accepts blank lines, comments, quoted values, and empty values. It
+does not expand variables or execute substitutions. JSON, YAML, and TOML must
+contain one flat object whose keys and values are strings. Nested objects or
+tables, arrays, numbers, booleans, dates, null values, duplicate keys, and
+empty keys are rejected. Every format must contain at least one secret.
+Dopbase validates the complete input before changing server state.
+
+The format is inferred from `.json`, `.yaml`, `.yml`, and `.toml`. Every other
+filename, including `.env.production`, defaults to dotenv. Use `--format` to
+override the filename or when reading from stdin:
+
+```bash
+dopbase import payment-service/staging secrets.data --format json
+cat secrets.yml | dopbase import payment-service/staging - --format yaml
+cat secrets.toml | dopbase import payment-service/staging - --format toml
+cat .env | dopbase init worker/development --from - --format dotenv
+```
+
+Stdin imports need an existing valid login or `DOPBASE_TOKEN`. The CLI cannot
+use the same stdin stream for both secret data and an interactive login.
+
+## Export
+
+Export requires an explicit file or stdout destination:
+
+```bash
+dopbase export payment-service/staging --output .env.staging
+dopbase export payment-service/staging --output secrets.json
+dopbase export payment-service/staging --output secrets.toml
+dopbase export payment-service/staging --stdout --format yaml
+```
+
+File output uses the filename rules above. Stdout defaults to dotenv. Pass
+`--format` to choose another format. Docker format is available only for export
+and must be selected explicitly. All export formats sort keys so repeated
+exports have stable output.
+
+Use Docker format to inject secrets into an existing container:
+
+```bash
+dopbase export payment-service/staging --stdout --format docker |
+  docker exec \
+    --env-file=/dev/stdin \
+    --user node \
+    -w /workspace \
+    container-name \
+    node script.js
+```
+
+Docker reads raw `KEY=value` lines. Spaces and extra `=` characters stay in the
+value, and quotes stay literal, so Docker export does not add quotes. It rejects
+line breaks and NUL bytes. Use a mounted secret file for multiline certificates
+or private keys.
+
+The example omits `-i` because Docker uses stdin for `--env-file`. A process
+that also needs stdin should use a temporary private env file and remove it
+afterward.
+
+Export refuses to overwrite an existing file without `--force` and uses
+restrictive permissions where supported. Export reveals plaintext values, so
+it is permission-controlled and audited. Every CLI export requires an
+interactive password confirmation. There is no non-interactive bypass.
+
+Prefer [`dopbase run`](./run-an-application) when an application only needs
+secrets in its process environment.
+
+The Admin UI supports dotenv files. It parses the file locally, shows a key
+review and a dry-run summary before applying, and downloads dotenv exports.
+See [import and export](/ui/import-export).
+
+## Handle values safely
+
+Import and export output never echoes secret values as status information.
+Do not paste `.env` contents, revealed output, private service URLs, or tokens
+into logs, screenshots, issues, or shell history.

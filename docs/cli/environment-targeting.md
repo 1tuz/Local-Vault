@@ -1,0 +1,145 @@
+---
+title: "Target projects and environments"
+description: "Target a Dopbase project and environment explicitly or save a server-scoped default for dopbase run."
+---
+
+# Target projects and environments
+
+Dopbase uses explicit environment targeting for management commands. It does
+not place configuration in an application repository. For `dopbase run`, it
+can remember one server-scoped default environment in the user configuration.
+
+New environment IDs use six random digits, such as `env_482731`. Existing IDs
+continue to work.
+
+An environment ID is safe to include in deployment configuration, but it is
+not a credential. Secret access still requires an authenticated administrator
+or a runner token scoped to that environment.
+
+The server connection is separate machine-global state. With no configured
+server, Dopbase uses `http://localhost:8840`. `client connect` can select another
+endpoint. See [client configuration](./configuration).
+
+This keeps the selected environment visible at the point where secrets are
+read or changed:
+
+```bash
+dopbase secret list storefront/production
+dopbase import storefront/staging .env.staging
+dopbase run env_482731 -- ./storefront
+```
+
+For repeated interactive runs, save the immutable environment ID as the
+default:
+
+```bash
+dopbase env default storefront/development
+dopbase run -- ./storefront
+```
+
+The positional reference and `DOPBASE_ENV` still take precedence. Clear the
+saved value with `dopbase env default --clear`.
+
+## Why the environment is enough
+
+An environment belongs to exactly one project:
+
+```text
+storefront
+├── development  env_482731
+├── staging      env_190482
+└── production   env_735104
+```
+
+The environment reference therefore identifies both the project and the set
+of secrets. Commands do not need a separately selected project.
+
+Humans can use `storefront/staging`. Deployment systems should use the
+immutable environment ID so a rename cannot change what the server runs.
+
+## Start from an existing `.env`
+
+Connect and sign in, then bootstrap the project and first environment:
+
+```bash
+dopbase client connect https://dopbase.example.com
+dopbase login
+dopbase init
+```
+
+`init` validates the file and atomically creates the project, environment, and
+individual secrets. The interactive command asks for `storefront/development`
+and offers to delete `.env` after the import. It does not write a Dopbase
+configuration file into the repository.
+
+Clone the first environment when another environment should start with the
+same secrets:
+
+```bash
+dopbase env clone storefront/development staging
+dopbase env clone storefront/staging production
+```
+
+The clone command confirms the source, destination, and secret count before it
+creates anything. It copies current secret values in memory without creating a
+temporary file. A successful clone prints all environments in the project,
+including each immutable ID. Keep the production and staging IDs in the
+corresponding deployment configuration, not in the application repository.
+
+Cloning creates a snapshot. Later changes to one environment do not update the
+other. Use `dopbase import` when an environment needs values from a different
+file instead.
+
+## Run the same project on two servers
+
+Assume both application servers connect to the same Dopbase endpoint. Create a
+runner token scoped to each environment:
+
+```bash
+dopbase token create storefront/production \
+  --name storefront-production-server --role runner
+
+dopbase token create storefront/staging \
+  --name storefront-staging-server --role runner
+```
+
+Configure the production application server:
+
+```bash
+export DOPBASE_URL=https://dopbase.example.com
+export DOPBASE_TOKEN=<production-runner-token>
+dopbase run env_<production-id> -- ./storefront
+```
+
+Configure the staging application server with its own environment ID and
+token:
+
+```bash
+export DOPBASE_URL=https://dopbase.example.com
+export DOPBASE_TOKEN=<staging-runner-token>
+dopbase run env_<staging-id> -- ./storefront
+```
+
+The application artifact can be identical on both servers. The environment ID
+and scoped runner token determine which values reach each process. If the
+staging server is accidentally given the production environment ID, its
+staging token cannot access that environment and Dopbase stops before starting
+the application.
+
+For a service definition that keeps runtime settings in environment variables,
+set `DOPBASE_ENV` and omit the positional reference:
+
+```bash
+export DOPBASE_ENV=env_<production-id>
+dopbase run -- ./storefront
+```
+
+This is explicit deployment configuration and takes precedence over any saved
+default.
+
+## Different Dopbase servers
+
+Environment IDs are local to the Dopbase server that created them. If two
+application servers use different Dopbase instances, each deployment must set
+its own `DOPBASE_URL`, token, and environment ID. Dopbase never silently falls
+back to another endpoint or maps IDs between servers.

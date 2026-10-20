@@ -1,0 +1,12 @@
+node_modules/
+/target/
+/app/target/
+dist/
+docs/.vitepress/cache/
+docs/.vitepress/dist/
+.DS_Store
+*.DS_Store
+*.local
+*.codegraph
+package.dev.json
+src-tauri/binaries/dopbase-*

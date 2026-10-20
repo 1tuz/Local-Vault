@@ -1,0 +1,21 @@
+[package]
+name = "dopbase-desktop"
+version = "0.1.9"
+edition = "2024"
+license = "Apache-2.0"
+build = "build.rs"
+
+[[bin]]
+name = "dopbase-desktop"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+app = { package = "app", path = "../app" }
+tauri = { version = "2", features = [] }
+tokio = { version = "1", features = ["sync", "net", "io-util"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+url = "2"
