@@ -48,6 +48,8 @@
 
 Dopbase keeps application secrets organized by project and environment on infrastructure you control. Runtime data stays separate from the executable: its SQLite database, configuration, and master key live under `~/.dopbase` by default.
 
+This fork builds on [Dopbase](https://github.com/dopbase/dopbase), adding a standalone encrypted file vault and a Tauri desktop app.
+
 ## Quick start
 
 Install the latest release on macOS or Linux and start it:

@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  BUN_VERSION: "1.4.0"
+  CARGO_TERM_COLOR: always
+  RUST_VERSION: "1.98.0"
+
+jobs:
+  quality:
+    name: Quality gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install "${RUST_VERSION}" \
+            --profile minimal \
+            --component rustfmt \
+            --component clippy
+          rustup default "${RUST_VERSION}"
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: app -> target
+          cache-workspace-crates: false
+
+      - name: Install frontend dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Check release and repository scripts
+        run: bun run test:github
+
+      - name: Check frontend, Rust, and documentation
+        run: |
+          bun run test:ui
+          bun run test:docs
+          bun run build:ui
+          bun run format:app:check
+          bun run lint:app
+          bun run test:app
+          bun run build:docs
