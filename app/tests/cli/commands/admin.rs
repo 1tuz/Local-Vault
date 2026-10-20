@@ -240,6 +240,7 @@ async fn factory_reset_command_requires_a_stopped_instance_and_root_confirmation
   let lock = app::server::InstanceLock::acquire(&url).unwrap();
   assert!(app::server::InstanceLock::is_held(&url).unwrap());
   let mut cmd = command(&fixture.data_dir);
+  cmd.env("HOME", fixture.directory.path());
   cmd.args(["admin", "factory-reset"]);
   let mut terminal = Terminal::new(cmd);
   assert_eq!(terminal.finish().code(), Some(1));
@@ -256,6 +257,7 @@ async fn factory_reset_command_requires_a_stopped_instance_and_root_confirmation
     ("please-wipe-out-system\r", Some(PASSWORD), 0),
   ] {
     let mut cmd = command(&fixture.data_dir);
+    cmd.env("HOME", fixture.directory.path());
     cmd.args(["admin", "factory-reset"]);
     let mut terminal = Terminal::new(cmd);
     terminal.reply("Type please-wipe-out-system", phrase);
