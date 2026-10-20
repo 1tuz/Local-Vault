@@ -73,7 +73,11 @@ describe("ProjectRail", () => {
     mountProjectRail(controller);
 
     document.body
-      .querySelector<HTMLButtonElement>('[aria-label="Rename payment"]')
+      .querySelector<HTMLButtonElement>('[aria-label="Actions for payment"]')
+      ?.click();
+    await nextTick();
+    Array.from(document.body.querySelectorAll("button"))
+      .find((button) => button.textContent?.trim() === "Rename project")
       ?.click();
     await nextTick();
 
@@ -102,7 +106,11 @@ describe("ProjectRail", () => {
     mountProjectRail(controller);
 
     document.body
-      .querySelector<HTMLButtonElement>('[aria-label="Delete payment"]')
+      .querySelector<HTMLButtonElement>('[aria-label="Actions for payment"]')
+      ?.click();
+    await nextTick();
+    Array.from(document.body.querySelectorAll("button"))
+      .find((button) => button.textContent?.trim() === "Delete project")
       ?.click();
     await nextTick();
 

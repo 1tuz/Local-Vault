@@ -8,6 +8,7 @@ import * as projectsApi from "~/services/projects.api";
 import * as environmentsApi from "~/services/environments.api";
 import * as secretsApi from "~/services/secrets.api";
 import * as tokensApi from "~/services/tokens.api";
+import * as vaultApi from "~/services/vault.api";
 
 vi.mock("vue", async (importOriginal) => ({
   ...(await importOriginal<typeof import("vue")>()),
@@ -22,6 +23,7 @@ const { routerPush, routerReplace, route } = await vi.hoisted(async () => {
     routerReplace: vi.fn(),
     route: reactive({
       params: {} as Record<string, string | undefined>,
+      query: {} as Record<string, string | undefined>,
       name: "environment",
     }),
   };
@@ -36,6 +38,7 @@ vi.mock("~/services/projects.api");
 vi.mock("~/services/environments.api");
 vi.mock("~/services/secrets.api");
 vi.mock("~/services/tokens.api");
+vi.mock("~/services/vault.api", () => ({ listVaultTree: vi.fn() }));
 
 const project = {
   id: "prj_1",
@@ -79,8 +82,10 @@ beforeEach(() => {
     otherProject,
   ]);
   vi.mocked(environmentsApi.listEnvironments).mockResolvedValue([]);
+  vi.mocked(vaultApi.listVaultTree).mockResolvedValue([]);
   route.params.projectRef = undefined;
   route.params.environmentId = undefined;
+  route.query = {};
   route.name = "environment";
   routerPush.mockReset();
   routerReplace.mockReset();
@@ -111,7 +116,7 @@ describe("useProjectsController", () => {
     // `createProject` itself never lists projects: the single call is the reload.
     expect(projectsApi.listProjects).toHaveBeenCalledTimes(1);
     expect(routerPush).toHaveBeenCalledWith({
-      name: "project",
+      name: "project-files",
       params: { projectRef: "prj_1" },
     });
   });
@@ -164,8 +169,9 @@ describe("useProjectsController", () => {
 
     expect(projectsApi.renameProject).toHaveBeenCalledWith("prj_1", "billing");
     expect(routerReplace).toHaveBeenCalledWith({
-      name: "environment",
-      params: { projectRef: "prj_1", environmentId: "env_1" },
+      name: "project-files",
+      params: { projectRef: "prj_1" },
+      query: { environmentId: "env_1" },
     });
   });
 
@@ -232,6 +238,7 @@ describe("useProjectsController", () => {
   });
 
   it("describeEnvironmentDeletion previews affected counts", async () => {
+    route.params.projectRef = "app";
     vi.mocked(secretsApi.listSecrets).mockResolvedValueOnce([
       { key: "A", version: 1, createdAt: "", updatedAt: "" },
       { key: "B", version: 1, createdAt: "", updatedAt: "" },
@@ -250,11 +257,12 @@ describe("useProjectsController", () => {
     const c = createController();
     await expect(c.describeEnvironmentDeletion("env_1")).resolves.toEqual([
       { label: "secrets", count: 2 },
-      { label: "runner tokens", count: 1 },
+      { label: "files using this tag", count: 0 },
+      { label: "folders using this tag", count: 0 },
     ]);
   });
 
-  it("reselects the first environment when switching projects", async () => {
+  it("does not carry the previous environment filter when switching projects", async () => {
     route.name = "project";
     route.params.projectRef = "app";
     route.params.environmentId = "env_1";
@@ -276,6 +284,7 @@ describe("useProjectsController", () => {
     // request is in flight the stale list must not trigger a selection.
     route.params.projectRef = "other";
     route.params.environmentId = undefined;
+    route.query = {};
     await vi.waitFor(() => expect(c.environments.value).toBeNull());
     expect(routerReplace).not.toHaveBeenCalledWith(
       expect.objectContaining({ name: "environment" }),
@@ -285,8 +294,9 @@ describe("useProjectsController", () => {
     resolveOther([environment("env_9", "prod", "prj_2")]);
     await vi.waitFor(() =>
       expect(routerReplace).toHaveBeenCalledWith({
-        name: "environment",
-        params: { projectRef: "other", environmentId: "env_9" },
+        name: "project-files",
+        params: { projectRef: "other" },
+        query: undefined,
       }),
     );
   });

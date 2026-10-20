@@ -50,6 +50,20 @@ vi.mock("./components/ProjectRail.vue", async () => {
   const { defineComponent } = await import("vue");
   return { default: defineComponent({ render: () => null }) };
 });
+vi.mock("./components/ProjectFilesPanel.vue", async () => {
+  const { defineComponent, h } = await import("vue");
+  return {
+    default: defineComponent({
+      props: ["projectRef"],
+      render() {
+        return h("div", {
+          "data-testid": "files-project-ref",
+          textContent: this.projectRef,
+        });
+      },
+    }),
+  };
+});
 vi.mock("./components/SecretsPanel.vue", async () => {
   const { defineComponent } = await import("vue");
   return { default: defineComponent({ render: () => null }) };
@@ -74,25 +88,14 @@ afterEach(() => {
 });
 
 describe("ProjectsPage", () => {
-  it("shows and copies the selected environment ID", async () => {
-    const writeText = vi.fn(async () => undefined);
-    Object.defineProperty(navigator, "clipboard", {
-      value: { writeText },
-      configurable: true,
-    });
+  it("renders the selected project file workspace", () => {
     const host = document.createElement("div");
     document.body.append(host);
     app = createApp({ render: () => h(ProjectsPage) });
     app.mount(host);
 
     expect(
-      host.querySelector('[data-testid="environment-id"]')?.textContent?.trim(),
-    ).toBe("env_482731");
-    const copyButton = Array.from(host.querySelectorAll("button")).find(
-      (button) => button.textContent?.trim() === "Copy ID",
-    );
-    copyButton?.click();
-    await nextTick();
-    expect(writeText).toHaveBeenCalledWith("env_482731");
+      host.querySelector('[data-testid="files-project-ref"]')?.textContent,
+    ).toBe("prj_1");
   });
 });
