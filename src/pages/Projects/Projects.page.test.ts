@@ -1,5 +1,5 @@
 /* eslint-disable vue/one-component-per-file */
-import { createApp, h, nextTick } from "vue";
+import { createApp, h } from "vue";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const { controller } = await vi.hoisted(async () => {
