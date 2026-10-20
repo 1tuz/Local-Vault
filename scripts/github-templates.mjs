@@ -307,7 +307,7 @@ function main() {
   if (command === "previous-version") {
     const currentVersion = option("--version");
     const commit = option("--commit");
-    const tags = execFileSync("git", ["tag", "--merged", `${commit}^`], {
+    const tags = execFileSync("git", ["tag", "--merged", commit], {
       encoding: "utf8",
     }).split("\n");
     console.log(findPreviousVersion(currentVersion, tags));
