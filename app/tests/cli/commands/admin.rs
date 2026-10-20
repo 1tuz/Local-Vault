@@ -238,11 +238,16 @@ async fn factory_reset_command_requires_a_stopped_instance_and_root_confirmation
   let key = std::fs::read(fixture.data_dir.join("master.key")).unwrap();
   let url = app::config::sqlite_url(&fixture.data_dir.join("dopbase.db"));
   let lock = app::server::InstanceLock::acquire(&url).unwrap();
+  assert!(app::server::InstanceLock::is_held(&url).unwrap());
   let mut cmd = command(&fixture.data_dir);
   cmd.args(["admin", "factory-reset"]);
   let mut terminal = Terminal::new(cmd);
   assert_eq!(terminal.finish().code(), Some(1));
-  assert!(terminal.transcript.contains("fully stopped"));
+  assert!(
+    terminal.transcript.contains("fully stopped"),
+    "expected the running-instance message, got: {}",
+    terminal.transcript
+  );
   drop(lock);
   for (phrase, password, expected) in [
     ("wrong phrase\r", None, 1),
