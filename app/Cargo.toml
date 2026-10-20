@@ -33,7 +33,7 @@ zip = { version = "2.2", default-features = false, features = ["deflate"] }
 tower-http = { version = "0.7", features = ["request-id", "timeout", "trace"] }
 # API Documentation
 utoipa = { version = "5", features = ["axum_extras"] }
-utoipa-swagger-ui = { version = "9", features = ["axum"] }
+utoipa-swagger-ui = { version = "9", features = ["axum", "vendored"] }
 # SQLite driver, connection pool, and runtime migrations
 sqlx = { version = "0.8", default-features = false, features = [
   "sqlite",
