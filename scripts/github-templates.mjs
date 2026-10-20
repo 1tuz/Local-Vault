@@ -284,7 +284,7 @@ export function renderReleaseNotes({
 
 function option(name) {
   const index = process.argv.indexOf(name);
-  if (index === -1 || !process.argv[index + 1]) {
+  if (index === -1 || index + 1 >= process.argv.length) {
     throw new Error(`Missing required option ${name}.`);
   }
   return process.argv[index + 1];
