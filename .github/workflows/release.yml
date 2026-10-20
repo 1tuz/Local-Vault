@@ -71,7 +71,7 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          workspaces: app -> target
+          workspaces: . -> target
           key: prepare
           cache-workspace-crates: false
 
@@ -177,7 +177,7 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          workspaces: app -> target
+          workspaces: . -> target
           key: release-${{ matrix.target }}
           cache-workspace-crates: false
 
@@ -199,11 +199,11 @@ jobs:
 
       - name: Smoke-test release binary
         shell: bash
-        run: bash scripts/release/smoke-test.sh "app/target/$RELEASE_TARGET/release/dopbase" "$RELEASE_VERSION"
+        run: bash scripts/release/smoke-test.sh "target/$RELEASE_TARGET/release/dopbase" "$RELEASE_VERSION"
 
       - name: Package release archive
         shell: bash
-        run: bash scripts/release/package-archive.sh "app/target/$RELEASE_TARGET/release/dopbase" "$RELEASE_VERSION" "$ASSET_OS" "$ASSET_ARCH" "$GITHUB_WORKSPACE"
+        run: bash scripts/release/package-archive.sh "target/$RELEASE_TARGET/release/dopbase" "$RELEASE_VERSION" "$ASSET_OS" "$ASSET_ARCH" "$GITHUB_WORKSPACE"
 
       - name: Upload release archive
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
