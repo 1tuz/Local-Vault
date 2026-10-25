@@ -399,9 +399,10 @@ dopbase files payment-service file rollback production/cluster/kubeconfig 2
 dopbase files payment-service file reveal production/cluster/kubeconfig
 ```
 
-Reveal requires recent human authentication. MCP exposes file metadata only and
-does not reveal file contents. Use the Admin UI to delete files, empty folders,
-or individual archived versions. `vault` remains a CLI alias for `files`.
+Reveal requires an authenticated project-manager session. MCP exposes file
+metadata only and does not reveal file contents. Use the Admin UI to delete
+files, empty folders, or individual archived versions. `vault` remains a CLI
+alias for `files`.
 
 ## Import and export
 

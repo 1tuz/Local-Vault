@@ -161,7 +161,7 @@ pub enum FileCommand {
     /// File path or ID.
     file_id: String,
   },
-  /// Reveal file bytes after interactive password confirmation.
+  /// Reveal file bytes using the authenticated human session.
   #[command(after_help = FILE_REVEAL_HELP)]
   Reveal {
     /// File path or ID.
@@ -218,8 +218,8 @@ Examples:
   dopbase files AppFarm file versions production/cluster/kubeconfig
   dopbase files AppFarm file rollback production/cluster/kubeconfig 2
 
-File content is encrypted by the server. `reveal` requires recent human
-authentication. AI-agent tokens can list metadata only and cannot reveal,
+File content is encrypted by the server. `reveal` requires an authenticated
+project-manager session. AI-agent tokens can list metadata only and cannot reveal,
 create, update, roll back, or delete Vault data.
 ";
 
@@ -294,7 +294,7 @@ const FILE_REVEAL_HELP: &str = "\
 Examples:
   dopbase files AppFarm file reveal production/cluster/kubeconfig > config
 
-Requires recent human password confirmation. Binary files are written to stdout as raw bytes.
+Requires an authenticated project-manager session. Binary files are written to stdout as raw bytes.
 ";
 const FILE_UPDATE_HELP: &str = "\
 Examples:

@@ -2,6 +2,21 @@
 
 All notable changes to Dopbase are documented in this file.
 
+## Unreleased
+
+### Fixed
+
+- `dopbase files <PROJECT> file reveal` uses an authenticated project-manager
+  session instead of asking for an interactive password confirmation the
+  server never required for project files. Secret-value reveal and export still
+  require recent password authentication.
+- The AI-agent MCP instructions state that secret and project-file contents are
+  never returned and that the administrator password cannot unlock them, and
+  point the user to the Admin UI instead.
+- The project files panel clears a stale clipboard error after a later copy
+  succeeds.
+- Documented the missing Vault folder, file, and file-reveal audit events.
+
 ## 0.1.9 - 2026-10-07
 
 [Dopbase](https://dopbase.com) 0.1.9 adds guided server setup, optional web UI,

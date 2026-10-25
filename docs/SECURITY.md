@@ -13,8 +13,8 @@ below are completed.**
   loads the original Vue Admin UI in a Tauri WebView. The existing CLI and
   desktop use the same configured server port and `~/.dopbase` data directory.
 - Existing authentication, roles, CSRF checks, audit records, encrypted
-  backups, and CLI workflows remain in use. Browser reveal/copy uses the
-  active authenticated session; bulk secret export still requires recent
+  backups, and CLI workflows remain in use. Browser and project-file reveal/copy
+  use the active authenticated session; bulk secret export still requires recent
   password confirmation.
 - Creating an AI-agent token requires an authenticated Admin browser session
   and CSRF token, but does not require recent password confirmation. The

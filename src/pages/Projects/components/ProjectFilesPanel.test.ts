@@ -25,11 +25,6 @@ vi.mock("~/services/environments.api", () => ({
   createEnvironment: vi.fn(),
   listEnvironments: vi.fn(async () => []),
 }));
-vi.mock("~/composable", () => ({
-  useReauthentication: () => ({
-    runWithReauth: vi.fn(async (action: () => Promise<void>) => action()),
-  }),
-}));
 
 import ProjectFilesPanel from "./ProjectFilesPanel.vue";
 
@@ -608,7 +603,7 @@ describe("ProjectFilesPanel", () => {
     expect(api.createVaultFolder).not.toHaveBeenCalled();
   });
 
-  it("copies a file directly from its row after reauthentication", async () => {
+  it("copies a file directly from its row in the current session", async () => {
     const file = {
       id: "file-1",
       folderId: "folder-1",
@@ -645,6 +640,70 @@ describe("ProjectFilesPanel", () => {
       expect(writeText).toHaveBeenCalledWith("private value"),
     );
     expect(api.revealVaultFile).toHaveBeenCalledWith("project-1", "file-1");
+  });
+
+  it("clears a failed copy error after a later copy succeeds", async () => {
+    const file = {
+      id: "file-1",
+      folderId: "folder-1",
+      name: "secret.txt",
+      kind: "secret",
+      encoding: "utf-8",
+      version: 1,
+      createdAt: "",
+      updatedAt: "",
+    };
+    api.listVaultFiles.mockResolvedValue([file]);
+    api.listVaultFileVersions.mockResolvedValue([]);
+    api.revealVaultFile.mockResolvedValue({
+      ...file,
+      content: "private value",
+    });
+    const writeText = vi
+      .fn<() => Promise<void>>()
+      .mockRejectedValueOnce(new Error("denied"))
+      .mockResolvedValueOnce(undefined);
+    vi.stubGlobal("navigator", { clipboard: { writeText } });
+    const host = document.createElement("div");
+    document.body.append(host);
+    app = createApp({
+      render: () => h(ProjectFilesPanel, { projectRef: "project-1" }),
+    });
+    app.mount(host);
+    await vi.waitFor(() =>
+      expect(
+        host.querySelector('button[aria-label="Reveal secret.txt"]'),
+      ).not.toBeNull(),
+    );
+
+    host
+      .querySelector<HTMLButtonElement>(
+        'button[aria-label="Reveal secret.txt"]',
+      )
+      ?.click();
+    await vi.waitFor(() =>
+      expect(
+        document.body.querySelector<HTMLTextAreaElement>(
+          '[role="dialog"] textarea',
+        )?.value,
+      ).toBe("private value"),
+    );
+
+    const copyButton = Array.from(
+      document.body.querySelectorAll<HTMLButtonElement>(
+        '[role="dialog"] button',
+      ),
+    ).find((button) => button.textContent?.trim() === "Copy");
+    if (!copyButton) throw new Error("detail copy button was not rendered");
+    copyButton.click();
+    await vi.waitFor(() =>
+      expect(host.textContent).toContain("Clipboard access was denied."),
+    );
+    copyButton.click();
+    await vi.waitFor(() =>
+      expect(host.textContent).not.toContain("Clipboard access was denied."),
+    );
+    expect(writeText).toHaveBeenCalledTimes(2);
   });
 
   it("keeps the file tree visually seamless while retaining column labels", async () => {

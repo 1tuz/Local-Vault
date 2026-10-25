@@ -17,6 +17,10 @@ authorization is enforced on every request. Choose a global metadata token to
 read across projects or a project token to read and write within one project in
 **Users → Get token**.
 
+MCP cannot read secret or project-file contents, and the Dopbase administrator
+password cannot enable that access. An agent should explain this limitation
+instead of asking for the password; view file contents in the Admin UI.
+
 Create an AI agent in **Users → Add AI agent**, copy its one-time token, and
 provide it from a protected credential store:
 

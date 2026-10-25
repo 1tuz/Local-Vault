@@ -524,6 +524,26 @@ async fn encrypted_files_keep_versions_and_agent_tokens_cannot_reveal_or_write()
   assert!(!denied_reveal.status.success());
   assert!(!String::from_utf8_lossy(&denied_reveal.stdout).contains("apiVersion"));
 
+  let cli_reveal = run_cli(
+    url.clone(),
+    cli_token.clone(),
+    vec![
+      "files".into(),
+      project_id.clone(),
+      "file".into(),
+      "reveal".into(),
+      "production/cluster/config".into(),
+    ],
+  )
+  .await;
+  assert!(
+    cli_reveal.status.success(),
+    "{}",
+    String::from_utf8_lossy(&cli_reveal.stderr)
+  );
+  let cli_reveal: Value = serde_json::from_slice(&cli_reveal.stdout).unwrap();
+  assert_eq!(cli_reveal["content"], "apiVersion: v1\n");
+
   let created_folder = run_cli(
     url.clone(),
     cli_token.clone(),
@@ -762,6 +782,12 @@ async fn encrypted_files_keep_versions_and_agent_tokens_cannot_reveal_or_write()
     .map(|line| serde_json::from_str::<Value>(line).unwrap())
     .collect::<Vec<_>>();
   assert_eq!(responses.len(), 5);
+  assert!(
+    responses[0]["result"]["instructions"]
+      .as_str()
+      .unwrap()
+      .contains("Never ask for the Dopbase administrator password")
+  );
   assert!(
     responses[1]["result"]["tools"]
       .as_array()
