@@ -134,12 +134,11 @@ contents before importing.
 
 Use `--dry-run` to validate the file and preview counts before importing. Names
 are checked against the Vault name rule before any write, so a rejected name
-never reaches the server. Vault deletions are Admin UI only: if an API request
-fails after writing began, the CLI tries to remove what it created, and a
-refused cleanup tells you to delete the destination folder in the Admin UI
-instead. Value revisions and nested folder paths are preserved. See the
-[Local Vault migration guide](/guide/local-vault-migration) for type mappings,
-base64 behavior, and limitations.
+never reaches the server. The whole import is one server request, so a failed
+import writes nothing: no folder or file is created, and the source file and the
+encrypted backup stay intact. Value revisions and nested folder paths are
+preserved. See the [Local Vault migration guide](/guide/local-vault-migration)
+for type mappings, base64 behavior, and limitations.
 
 The server resolution order is:
 

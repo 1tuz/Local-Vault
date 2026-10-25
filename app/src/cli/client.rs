@@ -105,13 +105,6 @@ pub fn is_conflict_error(error: &anyhow::Error) -> bool {
     .is_some_and(|error| error.status == reqwest::StatusCode::CONFLICT)
 }
 
-/// A refused authorization, such as the Admin-UI-only mutation guard.
-pub(crate) fn is_forbidden_error(error: &anyhow::Error) -> bool {
-  error
-    .downcast_ref::<ResponseError>()
-    .is_some_and(|error| error.status == reqwest::StatusCode::FORBIDDEN)
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum CredentialSource {
   Environment,

@@ -19,6 +19,11 @@ use std::collections::HashMap;
 use ulid::Ulid;
 
 const MAX_FILE_BYTES: usize = 1024 * 1024;
+const MAX_IMPORT_ENTRIES: usize = 1000;
+const MAX_IMPORT_VERSIONS: usize = 1000;
+const MAX_IMPORT_TOTAL_BYTES: usize = 32 * 1024 * 1024;
+const MAX_IMPORT_FOLDER_PATH_CHARS: usize = 160;
+const MAX_IMPORT_FOLDER_DEPTH: usize = 32;
 
 fn audit_actor(identity: &AuthIdentity) -> (&'static str, &str, Option<&str>) {
   match identity {
@@ -94,13 +99,25 @@ fn valid_encoding(
 
 fn db_error(error: sqlx::Error) -> HttpError {
   if matches!(&error, sqlx::Error::Database(_)) {
-    HttpError::conflict(
-      "VAULT_NAME_CONFLICT",
-      "A folder or file with this name already exists here.",
-    )
+    name_conflict()
   } else {
     HttpError::from(error)
   }
+}
+
+fn name_conflict() -> HttpError {
+  HttpError::conflict(
+    "VAULT_NAME_CONFLICT",
+    "A folder or file with this name already exists here.",
+  )
+}
+
+fn import_invalid(message: impl Into<String>) -> HttpError {
+  HttpError::new(
+    axum::http::StatusCode::BAD_REQUEST,
+    "VAULT_IMPORT_INVALID",
+    message,
+  )
 }
 
 pub async fn list_folders(
@@ -841,6 +858,290 @@ pub async fn delete_file(
   .await?;
   tx.commit().await?;
   Ok(())
+}
+
+/// Everything an import needs, validated before the transaction opens.
+struct ImportPlan {
+  root_name: String,
+  folders: Vec<PlannedFolder>,
+  files: Vec<PlannedFile>,
+  versions: usize,
+}
+
+struct PlannedFolder {
+  /// Case-insensitive canonical path, used to parent nested folders.
+  key: String,
+  parent_key: Option<String>,
+  name: String,
+}
+
+struct PlannedFile {
+  name: String,
+  /// `None` places the file directly in the imported root folder.
+  folder_key: Option<String>,
+  kind: VaultFileKind,
+  versions: Vec<(String, String)>,
+}
+
+fn plan_import(request: ImportVaultRequest) -> Result<ImportPlan, HttpError> {
+  let root_name = validation::valid_name(&request.folder)
+    .map_err(|reason| import_invalid(format!("Import folder name is invalid: {reason}")))?;
+  if request.entries.is_empty() {
+    return Err(import_invalid("An import must contain at least one entry."));
+  }
+  if request.entries.len() > MAX_IMPORT_ENTRIES {
+    return Err(import_invalid(format!(
+      "An import can contain at most {MAX_IMPORT_ENTRIES} entries."
+    )));
+  }
+  let mut folders = Vec::<PlannedFolder>::new();
+  let mut folder_keys = HashMap::<String, ()>::new();
+  let mut identities = HashMap::<String, ()>::new();
+  let mut files = Vec::<PlannedFile>::new();
+  let mut total_bytes = 0_usize;
+  for entry in request.entries {
+    let name = validation::valid_name(&entry.name).map_err(|reason| {
+      import_invalid(format!("File name {:?} is invalid: {reason}", entry.name))
+    })?;
+    let segments = import_folder_segments(&entry.folder)?;
+    let folder_key = (!segments.is_empty()).then(|| segments.join("/").to_lowercase());
+    for depth in 1..=segments.len() {
+      let key = segments[..depth].join("/").to_lowercase();
+      if folder_keys.insert(key.clone(), ()).is_none() {
+        folders.push(PlannedFolder {
+          parent_key: (depth > 1).then(|| segments[..depth - 1].join("/").to_lowercase()),
+          name: segments[depth - 1].clone(),
+          key,
+        });
+      }
+    }
+    let identity = format!(
+      "{}/{}",
+      folder_key.clone().unwrap_or_default(),
+      name.to_lowercase()
+    );
+    if identities.insert(identity, ()).is_some() {
+      return Err(import_invalid(format!(
+        "Duplicate file name {name:?} in folder {:?}.",
+        segments.join("/")
+      )));
+    }
+    if entry.versions.is_empty() {
+      return Err(import_invalid(format!(
+        "File {name:?} has no revisions to import."
+      )));
+    }
+    if entry.versions.len() > MAX_IMPORT_VERSIONS {
+      return Err(import_invalid(format!(
+        "File {name:?} has more than {MAX_IMPORT_VERSIONS} revisions."
+      )));
+    }
+    let mut versions = Vec::with_capacity(entry.versions.len());
+    for version in entry.versions {
+      if version.content.len() > MAX_FILE_BYTES || version.content.contains('\0') {
+        return Err(import_invalid(format!(
+          "File {name:?} contains content that must be text of at most 1 MiB without NUL bytes."
+        )));
+      }
+      total_bytes += version.content.len();
+      if total_bytes > MAX_IMPORT_TOTAL_BYTES {
+        return Err(import_invalid(format!(
+          "An import can contain at most {} MiB of content.",
+          MAX_IMPORT_TOTAL_BYTES / (1024 * 1024)
+        )));
+      }
+      let encoding = valid_encoding(&version.encoding, &version.content)?;
+      versions.push((encoding, version.content));
+    }
+    files.push(PlannedFile {
+      name,
+      folder_key,
+      kind: entry.kind,
+      versions,
+    });
+  }
+  let versions = files.iter().map(|file| file.versions.len()).sum();
+  Ok(ImportPlan {
+    root_name,
+    folders,
+    files,
+    versions,
+  })
+}
+
+fn import_folder_segments(path: &str) -> Result<Vec<String>, HttpError> {
+  if path.chars().count() > MAX_IMPORT_FOLDER_PATH_CHARS {
+    return Err(import_invalid(format!(
+      "A folder path must be at most {MAX_IMPORT_FOLDER_PATH_CHARS} characters."
+    )));
+  }
+  let mut segments = Vec::new();
+  for segment in path
+    .split(['/', '\\'])
+    .map(str::trim)
+    .filter(|part| !part.is_empty())
+  {
+    let segment = validation::valid_name(segment)
+      .map_err(|reason| import_invalid(format!("Folder path {path:?} is invalid: {reason}")))?;
+    segments.push(segment);
+    if segments.len() > MAX_IMPORT_FOLDER_DEPTH {
+      return Err(import_invalid(format!(
+        "A folder path can have at most {MAX_IMPORT_FOLDER_DEPTH} levels."
+      )));
+    }
+  }
+  Ok(segments)
+}
+
+async fn insert_imported_file(
+  state: &AppState,
+  tx: &mut sqlx::SqliteConnection,
+  folder_id: &str,
+  file: &PlannedFile,
+  now: &str,
+) -> Result<(), HttpError> {
+  let Some((encoding, content)) = file.versions.first() else {
+    return Err(HttpError::internal());
+  };
+  let id = Ulid::new().to_string();
+  let encrypted = state
+    .crypto
+    .encrypt(content.as_bytes(), &id, "vault-file", 1)
+    .map_err(|_| HttpError::internal())?;
+  let mut row = VaultFileRow {
+    id: id.clone(),
+    folder_id: folder_id.to_string(),
+    environment_id: None,
+    name: file.name.clone(),
+    kind: file.kind.as_db().into(),
+    encoding: encoding.clone(),
+    version: 1,
+    ciphertext: encrypted.ciphertext,
+    value_nonce: encrypted.value_nonce,
+    wrapped_key: encrypted.wrapped_key,
+    key_nonce: encrypted.key_nonce,
+    created_at: now.to_string(),
+    updated_at: now.to_string(),
+  };
+  repository::insert_file(tx, &row).await.map_err(db_error)?;
+  for (index, (encoding, content)) in file.versions.iter().enumerate().skip(1) {
+    let version = i64::try_from(index + 1).map_err(|_| HttpError::internal())?;
+    repository::archive_file(tx, &row, now).await?;
+    let encrypted = state
+      .crypto
+      .encrypt(content.as_bytes(), &id, "vault-file", version)
+      .map_err(|_| HttpError::internal())?;
+    repository::update_file(tx, &id, version, &encrypted, encoding, now)
+      .await
+      .map_err(db_error)?;
+    row.version = version;
+    row.encoding = encoding.clone();
+    row.ciphertext = encrypted.ciphertext;
+    row.value_nonce = encrypted.value_nonce;
+    row.wrapped_key = encrypted.wrapped_key;
+    row.key_nonce = encrypted.key_nonce;
+  }
+  Ok(())
+}
+
+/// Import a whole folder tree in one transaction.
+///
+/// The payload is validated completely before the transaction opens, so a
+/// rejected import never touches the database.
+pub async fn import(
+  state: &AppState,
+  identity: &AuthIdentity,
+  project_ref: &str,
+  request: ImportVaultRequest,
+) -> Result<VaultImportSummary, HttpError> {
+  let project_id = resolve_project(state, project_ref).await?;
+  require_project_write(identity, &project_id)?;
+  let plan = plan_import(request)?;
+  let now = Utc::now().to_rfc3339();
+  let mut tx = state.db.pool().begin_with("BEGIN IMMEDIATE").await?;
+  let project_root_id =
+    repository::ensure_project_root(&mut tx, &project_id, &Ulid::new().to_string(), &now).await?;
+  let existing: i64 = sqlx::query_scalar(
+    "SELECT COUNT(*) FROM vault_folders WHERE project_id=? AND parent_id=? AND name=? COLLATE NOCASE",
+  )
+  .bind(&project_id)
+  .bind(&project_root_id)
+  .bind(&plan.root_name)
+  .fetch_one(&mut *tx)
+  .await?;
+  if existing > 0 {
+    return Err(name_conflict());
+  }
+  let root_folder_id = Ulid::new().to_string();
+  repository::insert_folder(
+    &mut tx,
+    &root_folder_id,
+    &project_id,
+    Some(&project_root_id),
+    None,
+    &plan.root_name,
+    &now,
+  )
+  .await
+  .map_err(db_error)?;
+  let mut folder_ids = HashMap::<String, String>::new();
+  for folder in &plan.folders {
+    let id = Ulid::new().to_string();
+    let parent_id = folder
+      .parent_key
+      .as_ref()
+      .and_then(|key| folder_ids.get(key))
+      .map_or(root_folder_id.as_str(), String::as_str);
+    repository::insert_folder(
+      &mut tx,
+      &id,
+      &project_id,
+      Some(parent_id),
+      None,
+      &folder.name,
+      &now,
+    )
+    .await
+    .map_err(db_error)?;
+    folder_ids.insert(folder.key.clone(), id);
+  }
+  for file in &plan.files {
+    let folder_id = file
+      .folder_key
+      .as_ref()
+      .and_then(|key| folder_ids.get(key))
+      .map_or(root_folder_id.as_str(), String::as_str);
+    insert_imported_file(state, &mut tx, folder_id, file, &now).await?;
+  }
+  let folders = plan.folders.len() + 1;
+  let files = plan.files.len();
+  let versions = plan.versions;
+  let (actor_type, actor_id, actor_label) = audit_actor(identity);
+  common::audit(
+    &mut *tx,
+    actor_type,
+    Some(actor_id),
+    actor_label,
+    "vault.import.completed",
+    Some(&project_id),
+    None,
+    Some("vault_folder"),
+    Some(&root_folder_id),
+    serde_json::json!({
+      "folders": folders,
+      "files": files,
+      "versions": versions,
+      "destination": &plan.root_name,
+    }),
+  )
+  .await?;
+  tx.commit().await?;
+  Ok(VaultImportSummary {
+    folder_id: root_folder_id,
+    folders,
+    files,
+    versions,
+  })
 }
 
 #[cfg(test)]

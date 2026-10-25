@@ -8,15 +8,18 @@ use utoipa::OpenApi;
     controller::tree, controller::list_folders, controller::create_folder, controller::move_folder,
     controller::delete_folder, controller::set_folder_environment, controller::set_file_environment, controller::list_files, controller::create_file,
     controller::file_metadata, controller::update_file, controller::rename_file, controller::move_file, controller::delete_file,
-    controller::file_versions, controller::delete_file_version, controller::rollback_file, controller::reveal_file
+    controller::file_versions, controller::delete_file_version, controller::rollback_file, controller::reveal_file,
+    controller::import
   ),
   components(schemas(
     VaultFolder, VaultFolderContents, VaultFileKind, VaultFileMetadata, VaultFileVersion, CreateFolderRequest,
     MoveFolderRequest, MoveVaultFileRequest, RenameVaultFileRequest, CreateVaultFileRequest, UpdateVaultFileRequest, UpdateEnvironmentTagRequest, RevealedVaultFile,
+    ImportVaultRequest, ImportEntry, ImportVersion, VaultImportSummary,
     ErrorBody, HttpResponseFormat<Vec<VaultFolder>>, HttpResponseFormat<Vec<VaultFolderContents>>,
     HttpResponseFormat<VaultFolder>, HttpResponseFormat<Vec<VaultFileMetadata>>,
     HttpResponseFormat<VaultFileMetadata>, HttpResponseFormat<VaultFileVersion>,
     HttpResponseFormat<Vec<VaultFileVersion>>, HttpResponseFormat<RevealedVaultFile>,
+    HttpResponseFormat<VaultImportSummary>,
     HttpResponseFormat<serde_json::Value>
   )),
   tags((name="vault"))

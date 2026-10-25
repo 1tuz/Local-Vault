@@ -28,13 +28,17 @@ so dry-run and a real import reject the same names (including `.` and `..`).
 Before writing, the CLI also rejects a destination folder that already exists
 as a top-level folder of the project, compared case-insensitively.
 
-Deleting Vault folders and files is an Admin UI operation, so the CLI cannot
-undo a partial import. If an API request fails after writing began, the CLI
-tries to remove what it created; when the server refuses those deletions, the
-error names the destination folder, states that it still contains partially
-imported data, and points at the encrypted backup. Delete that folder in the
-Admin UI and import again under a new `--folder` name. The source file and the
-encrypted backup are never modified.
+The whole import is a single request to the server, and the server applies it
+in one transaction. A failed import writes nothing, so no partial folder tree
+or file remains, and the source file and the encrypted backup are never
+modified. Deleting Vault folders and files remains an Admin UI operation, but a
+failed import leaves nothing to delete. Resolve the reported problem and run
+the import again.
+
+The server enforces the import limits: at most 1000 entries, 1000 revisions per
+entry, 1 MiB per revision, and 32 MiB in total. A folder path can have at most
+160 characters and 32 levels. An import that exceeds a limit is rejected before
+anything is written.
 
 Legacy folder paths become nested folders. SSH, Kubernetes, environment, and
 generic file entries retain their matching type; API entries become generic

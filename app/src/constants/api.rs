@@ -199,6 +199,7 @@ pub mod vault {
   pub const FILE_VERSION: &str = api_path!("/projects/{project_ref}/files/{id}/versions/{version}");
   pub const FILE_ROLLBACK: &str =
     api_path!("/projects/{project_ref}/files/{id}/versions/{version}/rollback");
+  pub const IMPORT: &str = api_path!("/projects/{project_ref}/files/import");
 
   pub fn tree(project_ref: &str) -> String {
     super::render(TREE, &[("project_ref", project_ref)])
@@ -305,6 +306,10 @@ pub mod vault {
         ("version", &version.to_string()),
       ],
     )
+  }
+
+  pub fn import(project_ref: &str) -> String {
+    super::render(IMPORT, &[("project_ref", project_ref)])
   }
 }
 

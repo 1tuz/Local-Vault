@@ -1,8 +1,5 @@
 use crate::{
-  cli::{
-    client::{self, ApiClient},
-    output, prompt,
-  },
+  cli::{client, output, prompt},
   constants::api,
   legacy_vault::{self, LegacyEntry},
   modules::vault::validation,
@@ -33,7 +30,8 @@ Examples:
   dopbase migrate local-vault --folder \"Imported vault\" --backup ~/local-vault-backup.vault
 
 The old password is prompted without echo. The source file is never modified.
-Actual imports require a new verified encrypted backup; --dry-run writes nothing.";
+Actual imports require a new verified encrypted backup; --dry-run writes nothing.
+The import is applied atomically: a failure writes nothing to the project.";
 
 #[derive(Args, Debug)]
 pub struct LocalVaultArgs {
@@ -142,21 +140,41 @@ async fn migrate_local_vault(
   let backup = expand_home(backup);
   create_verified_backup(&backup, &encrypted)?;
 
-  import_entries(&api_client, &args.project, root_name, &entries, &backup)
+  let payload = import_payload(root_name, &entries)?;
+  let data = match api_client
+    .request(
+      Method::POST,
+      &api::vault::import(&args.project),
+      Some(payload),
+    )
     .await
-    .with_context(|| {
-      format!(
-        "Local Vault import failed; the original was preserved and its encrypted backup is at {}",
-        backup.display()
-      )
-    })?;
+  {
+    Ok(data) => data,
+    Err(error) if client::is_conflict_error(&error) => {
+      bail!("{}", duplicate_folder_message(&args.project, root_name))
+    }
+    Err(error) => bail!(
+      "Local Vault import failed; nothing was written to project {:?} and the source file plus its encrypted backup at {} are intact: {error:#}",
+      args.project,
+      backup.display()
+    ),
+  };
+  let folder_id = data
+    .get("folderId")
+    .and_then(Value::as_str)
+    .context("Dopbase did not return the imported folder id")?;
+  let (folders, files, versions) =
+    imported_counts(&data, (hierarchy.len() + 1, entries.len(), revision_count));
 
   let summary = json!({
     "dryRun": false,
     "source": source,
     "backup": backup,
+    "folderId": folder_id,
     "entries": entries.len(),
-    "versions": revision_count,
+    "folders": folders,
+    "files": files,
+    "versions": versions,
     "destination": root_name,
     "agentAccess": "not imported",
   });
@@ -166,7 +184,9 @@ async fn migrate_local_vault(
     output::print_success("Local Vault data imported into Dopbase Vault.");
     output::print_fields(&[
       ("Entries:", entries.len().to_string()),
-      ("Value revisions:", revision_count.to_string()),
+      ("Value revisions:", versions.to_string()),
+      ("Folders created:", folders.to_string()),
+      ("Files created:", files.to_string()),
       ("Destination:", root_name.to_owned()),
       ("Encrypted backup:", backup.display().to_string()),
       ("Agent access:", "not imported".into()),
@@ -365,195 +385,76 @@ fn create_verified_backup(
   Ok(())
 }
 
-async fn import_entries(
-  api_client: &ApiClient,
-  project_ref: &str,
+/// Build the single atomic `POST /projects/{project}/files/import` body.
+///
+/// Entries keep the Local Vault hierarchy as `/`-separated folder paths and
+/// every value revision in ascending order. The mapping from legacy kinds to
+/// the target `VaultFileKind` is unchanged from the per-call importer.
+fn import_payload(
   root_name: &str,
   entries: &[LegacyEntry],
-  backup: &Path,
-) -> Result<()> {
-  let mut created_folders = Vec::new();
-  let mut created_files = Vec::new();
-  let result = async {
-    let root = match create_folder(api_client, project_ref, root_name, None).await {
-      Ok(root) => root,
-      Err(error) if client::is_conflict_error(&error) => {
-        bail!("{}", duplicate_folder_message(project_ref, root_name))
-      }
-      Err(error) => return Err(error),
+) -> Result<Value> {
+  let mut payload_entries = Vec::with_capacity(entries.len());
+  for entry in entries {
+    let kind = match entry.kind.as_str() {
+      "ssh" => "sshPrivateKey",
+      "kubeconfig" => "kubeconfig",
+      "env" => "env",
+      "file" => "text",
+      // The target model treats API records as secret documents. Legacy
+      // agent_allowed flags are deliberately not transferred.
+      "secret" | "api" => "secret",
+      _ => bail!("unsupported legacy type {:?}", entry.kind),
     };
-    created_folders.push(root.clone());
-    let mut folder_ids = HashMap::<String, String>::new();
-    for entry in entries {
-      let segments = folder_segments(&entry.folder)?;
-      let mut parent_id = root.clone();
-      let mut path_parts = Vec::new();
-      for segment in segments {
-        path_parts.push(segment.clone());
-        let path = path_parts.join("/");
-        if let Some(id) = folder_ids.get(&path) {
-          parent_id.clone_from(id);
-        } else {
-          let id = create_folder(api_client, project_ref, &segment, Some(&parent_id)).await?;
-          created_folders.push(id.clone());
-          folder_ids.insert(path, id.clone());
-          parent_id = id;
-        }
-      }
-      let first = entry.versions.first().context("entry has no revisions")?;
-      let kind = match entry.kind.as_str() {
-        "ssh" => "sshPrivateKey",
-        "kubeconfig" => "kubeconfig",
-        "env" => "env",
-        "file" => "text",
-        // The target model treats API records as secret documents. Legacy
-        // agent_allowed flags are deliberately not transferred.
-        "secret" | "api" => "secret",
-        _ => bail!("unsupported legacy type {:?}", entry.kind),
-      };
-      let created = api_client
-        .request(
-          Method::POST,
-          &api::vault::folder_files(project_ref, &parent_id),
-          Some(json!({"name":entry.name,"kind":kind,"encoding":first.encoding,"content":first.content.as_str()})),
-        )
-        .await
-        .with_context(|| format!("could not import file {:?}", entry.name))?;
-      let file_id = created
-        .get("id")
-        .and_then(Value::as_str)
-        .context("Dopbase did not return an imported file id")?
-        .to_owned();
-      created_files.push(file_id.clone());
-      for version in entry.versions.iter().skip(1) {
-        api_client
-          .request(
-            Method::PUT,
-            &api::vault::file(project_ref, &file_id),
-            Some(json!({"content":version.content.as_str(),"encoding":version.encoding})),
-          )
-          .await
-          .with_context(|| {
-            format!(
-              "could not import revision {} of {:?}",
-              version.version, entry.name
-            )
-          })?;
-      }
+    if entry.versions.is_empty() {
+      bail!("entry {:?} has no revisions to import", entry.name);
     }
-    Ok::<(), anyhow::Error>(())
+    let versions = entry
+      .versions
+      .iter()
+      .map(|version| json!({"encoding": version.encoding, "content": version.content.as_str()}))
+      .collect::<Vec<_>>();
+    payload_entries.push(json!({
+      "name": entry.name,
+      "folder": folder_segments(&entry.folder)?.join("/"),
+      "kind": kind,
+      "versions": versions,
+    }));
   }
-  .await;
-  if let Err(error) = result {
-    if created_folders.is_empty() && created_files.is_empty() {
-      return Err(error);
-    }
-    let cleanup_errors =
-      rollback_created(api_client, project_ref, &created_files, &created_folders).await;
-    if cleanup_errors.is_empty() {
-      return Err(error).context("partial import was rolled back");
-    }
-    bail!(
-      "{}",
-      rollback_failure_message(&error, root_name, backup, &cleanup_errors)
-    );
-  }
-  Ok(())
+  Ok(json!({"folder": root_name.trim(), "entries": payload_entries}))
 }
 
-/// Describe a failed import whose cleanup could not be completed.
-///
-/// Deletions are Admin UI only, so a CLI session cannot undo a partial import.
-/// The message must say so instead of implying the tree was removed.
-fn rollback_failure_message(
-  error: &anyhow::Error,
-  root_name: &str,
-  backup: &Path,
-  failures: &[CleanupFailure],
-) -> String {
-  let details = failures
-    .iter()
-    .map(|failure| failure.detail.as_str())
-    .collect::<Vec<_>>()
-    .join("; ");
-  if failures.iter().any(|failure| failure.forbidden) {
-    return format!(
-      "{error:#}; automatic rollback was refused by the server, so the destination folder {root_name:?} still exists with partially imported data and must be deleted in the Admin UI. The encrypted source backup is at {}. Failed cleanup requests: {details}",
-      backup.display()
-    );
-  }
-  format!("{error:#}; automatic rollback was incomplete: {details}")
-}
-
-async fn create_folder(
-  api_client: &ApiClient,
-  project_ref: &str,
-  name: &str,
-  parent_id: Option<&str>,
-) -> Result<String> {
-  let response = api_client
-    .request(
-      Method::POST,
-      &api::vault::folders(project_ref),
-      Some(json!({"name":name,"parentId":parent_id})),
-    )
-    .await?;
-  response
-    .get("id")
-    .and_then(Value::as_str)
-    .map(str::to_owned)
-    .context("Dopbase did not return a created folder id")
-}
-
-struct CleanupFailure {
-  detail: String,
-  forbidden: bool,
-}
-
-async fn rollback_created(
-  api_client: &ApiClient,
-  project_ref: &str,
-  files: &[String],
-  folders: &[String],
-) -> Vec<CleanupFailure> {
-  let mut errors = Vec::new();
-  for id in files.iter().rev() {
-    if let Err(error) = api_client
-      .request(Method::DELETE, &api::vault::file(project_ref, id), None)
-      .await
-    {
-      errors.push(CleanupFailure {
-        detail: format!("file {id}: {error}"),
-        forbidden: client::is_forbidden_error(&error),
-      });
-    }
-  }
-  for id in folders.iter().rev() {
-    if let Err(error) = api_client
-      .request(Method::DELETE, &api::vault::folder(project_ref, id), None)
-      .await
-    {
-      errors.push(CleanupFailure {
-        detail: format!("folder {id}: {error}"),
-        forbidden: client::is_forbidden_error(&error),
-      });
-    }
-  }
-  errors
+/// Read the import counts from the response, falling back to the locally
+/// known numbers when the server omits a field.
+fn imported_counts(
+  data: &Value,
+  fallback: (usize, usize, usize),
+) -> (usize, usize, usize) {
+  let count = |field: &str, fallback: usize| {
+    data
+      .get(field)
+      .and_then(Value::as_u64)
+      .and_then(|value| usize::try_from(value).ok())
+      .unwrap_or(fallback)
+  };
+  (
+    count("folders", fallback.0),
+    count("files", fallback.1),
+    count("versions", fallback.2),
+  )
 }
 
 #[cfg(test)]
 mod tests {
   use super::{
-    CleanupFailure, destination_exists, folder_segments, rollback_failure_message,
-    validate_file_name, validate_import,
+    destination_exists, folder_segments, import_payload, imported_counts, validate_file_name,
+    validate_import,
   };
   use crate::{
     legacy_vault::{LegacyEntry, LegacyVersion},
     modules::vault::validation,
   };
-  use serde_json::json;
-  use std::path::Path;
+  use serde_json::{Value, json};
   use zeroize::Zeroizing;
 
   fn entry(
@@ -828,53 +729,100 @@ mod tests {
   }
 
   #[test]
-  fn reports_the_admin_ui_cleanup_requirement() {
-    let error = anyhow::anyhow!("could not import file \"notes.txt\"");
-    let failures = [CleanupFailure {
-      detail: "file 01: 403 Forbidden: AUTHORIZATION_DENIED: Admin UI only".into(),
-      forbidden: true,
-    }];
-    let message = rollback_failure_message(
-      &error,
-      "Imported vault",
-      Path::new("/tmp/local-vault-backup.vault"),
-      &failures,
-    );
-    assert!(
-      message.contains("still exists with partially imported data"),
-      "{message}"
-    );
-    assert!(
-      message.contains("must be deleted in the Admin UI"),
-      "{message}"
-    );
-    assert!(
-      message.contains("/tmp/local-vault-backup.vault"),
-      "the actionable message must name the encrypted backup: {message}"
-    );
-    assert!(
-      !message.contains("rolled back"),
-      "a refused rollback must never claim the tree was removed: {message}"
+  fn builds_one_atomic_import_payload() {
+    let mut multi = entry("deploy.sh", "Ops\\Prod", "ssh");
+    multi.versions = vec![
+      LegacyVersion {
+        version: 1,
+        encoding: "utf-8".into(),
+        content: Zeroizing::new("old".to_owned()),
+      },
+      LegacyVersion {
+        version: 2,
+        encoding: "base64".into(),
+        content: Zeroizing::new("bmV3".to_owned()),
+      },
+    ];
+    let entries = [
+      multi,
+      entry("notes.txt", "Ops", "file"),
+      entry("token", "", "api"),
+      entry("db.env", "Ops/Prod", "env"),
+    ];
+    let payload = import_payload("  Imported vault  ", &entries).unwrap();
+    assert_eq!(
+      payload,
+      json!({
+        "folder": "Imported vault",
+        "entries": [
+          {
+            "name": "deploy.sh",
+            "folder": "Ops/Prod",
+            "kind": "sshPrivateKey",
+            "versions": [
+              {"encoding": "utf-8", "content": "old"},
+              {"encoding": "base64", "content": "bmV3"},
+            ],
+          },
+          {
+            "name": "notes.txt",
+            "folder": "Ops",
+            "kind": "text",
+            "versions": [{"encoding": "utf-8", "content": "value"}],
+          },
+          {
+            "name": "token",
+            "folder": "",
+            "kind": "secret",
+            "versions": [{"encoding": "utf-8", "content": "value"}],
+          },
+          {
+            "name": "db.env",
+            "folder": "Ops/Prod",
+            "kind": "env",
+            "versions": [{"encoding": "utf-8", "content": "value"}],
+          },
+        ],
+      })
     );
   }
 
   #[test]
-  fn keeps_reporting_other_cleanup_failures() {
-    let error = anyhow::anyhow!("boom");
-    let failures = [CleanupFailure {
-      detail: "file 01: 500 Internal Server Error".into(),
-      forbidden: false,
-    }];
-    let message = rollback_failure_message(
-      &error,
-      "Imported vault",
-      Path::new("/tmp/local-vault-backup.vault"),
-      &failures,
+  fn maps_every_supported_legacy_kind() {
+    for (legacy, expected) in [
+      ("ssh", "sshPrivateKey"),
+      ("kubeconfig", "kubeconfig"),
+      ("env", "env"),
+      ("file", "text"),
+      ("secret", "secret"),
+      ("api", "secret"),
+    ] {
+      let payload = import_payload("Imported", &[entry("a", "Ops", legacy)]).unwrap();
+      assert_eq!(payload["entries"][0]["kind"], json!(expected), "{legacy}");
+    }
+  }
+
+  #[test]
+  fn rejects_payload_entries_without_revisions() {
+    let mut empty = entry("a", "Ops", "secret");
+    empty.versions.clear();
+    let error = import_payload("Imported", &[empty]).expect_err("no revisions must be rejected");
+    assert!(format!("{error:#}").contains("no revisions"), "{error:#}");
+  }
+
+  #[test]
+  fn reads_import_counts_and_falls_back_when_missing() {
+    let data = json!({"folderId": "f1", "folders": 3, "files": 4, "versions": 7});
+    assert_eq!(imported_counts(&data, (9, 9, 9)), (3, 4, 7));
+
+    let partial = json!({"folderId": "f1", "files": 4});
+    assert_eq!(
+      imported_counts(&partial, (3, 4, 5)),
+      (3, 4, 5),
+      "absent fields fall back to the locally known numbers"
     );
-    assert!(
-      message.contains("automatic rollback was incomplete: file 01: 500 Internal Server Error"),
-      "{message}"
-    );
-    assert!(!message.contains("Admin UI"), "{message}");
+
+    let invalid: Value = json!({"folders": "many"});
+    assert_eq!(imported_counts(&invalid, (1, 2, 3)), (1, 2, 3));
   }
 }

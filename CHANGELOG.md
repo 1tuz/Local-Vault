@@ -21,9 +21,7 @@ All notable changes to Dopbase are documented in this file.
   reached the server's conflict error. Folder and file names are validated
   against the Vault name rule before the first write, matching the server
   exactly, so a rejected name (including `.` and `..`) can no longer leave a
-  partial import behind. Vault deletions remain Admin-UI only; when the server
-  refuses the cleanup after a failed import, the error names the destination
-  folder and points at the Admin UI and the encrypted backup.
+  partial import behind.
 - Documented the missing Vault folder, file, and file-reveal audit events.
 
 ### Added
@@ -32,9 +30,17 @@ All notable changes to Dopbase are documented in this file.
   `LVLT0001` parsing, revision history, encoding metadata, and the format's
   rejection boundaries, and unit tests for the destination, name, and rollback
   rules of `migrate local-vault`. No real vault material is used or committed.
+- `POST /api/v1/projects/{project_ref}/files/import` imports a folder tree with
+  its file revisions in one request and one database transaction. It accepts up
+  to 1000 entries, 1000 revisions per entry, 1 MiB per revision, and 32 MiB in
+  total, records one `vault.import.completed` audit event, and returns `400`
+  for an invalid payload or `409` when the destination folder already exists.
 
 ### Changed
 
+- `dopbase migrate local-vault` sends the whole import as a single request to
+  the new import endpoint instead of one request per folder and file. A failed
+  import writes nothing, so no partial data is left to clean up.
 - Dependency refresh: rustls, rustls-webpki, webpki-roots, and tokio moved to
   versions without open advisories, and `zip` moved from 2.2 to 9.1 for its
   extraction advisories. The remaining audit findings are lockfile-only
