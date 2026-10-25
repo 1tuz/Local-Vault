@@ -22,7 +22,10 @@ RUN rustup component add clippy rustfmt
 
 WORKDIR /workspace
 
-COPY app/Cargo.toml app/Cargo.lock app/rustfmt.toml ./app/
+COPY Cargo.toml Cargo.lock ./
+COPY src-tauri/Cargo.toml src-tauri/build.rs ./src-tauri/
+COPY src-tauri/src ./src-tauri/src
+COPY app/Cargo.toml app/rustfmt.toml ./app/
 COPY app/src ./app/src
 COPY app/tests ./app/tests
 COPY app/migrations ./app/migrations

@@ -33,7 +33,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-cp ./target/release/dopbase "${binary}"
+cp ../target/release/dopbase "${binary}"
 cd "${runtime_root}"
 
 # Exercise every public command path against the release binary. The Rust CLI

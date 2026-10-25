@@ -57,7 +57,8 @@ Update the version in these authoritative files:
 - `package.json`
 - `app/Cargo.toml`
 
-Refresh `app/Cargo.lock` after changing `app/Cargo.toml`:
+Refresh the workspace `Cargo.lock` at the repository root after changing
+`app/Cargo.toml`; `app` is a workspace member, so it has no lockfile of its own:
 
 ```bash
 cargo check --manifest-path app/Cargo.toml
@@ -70,12 +71,12 @@ changelog entries, dependency versions, test fixtures, protocol versions, and
 format versions unchanged unless they actually refer to the product release.
 
 ```bash
-rg -n '<previous-version>' README.md docs package.json app/Cargo.toml app/Cargo.lock
+rg -n '<previous-version>' README.md docs package.json app/Cargo.toml Cargo.lock
 ```
 
 This step is complete when `package.json`, the `app` package in
-`app/Cargo.toml`, and the `app` package entry in `app/Cargo.lock` all contain the
-target version, and every documentation match has been reviewed.
+`app/Cargo.toml`, and the `app` package entry in the workspace `Cargo.lock` all
+contain the target version, and every documentation match has been reviewed.
 
 ## 3. Prepare the changelog
 
