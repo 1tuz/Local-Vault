@@ -9,6 +9,7 @@ pub mod doc;
 pub mod model;
 mod repository;
 pub mod service;
+pub mod validation;
 
 pub fn routes() -> Router<AppState> {
   Router::new()

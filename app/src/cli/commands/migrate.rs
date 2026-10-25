@@ -5,6 +5,7 @@ use crate::{
   },
   constants::api,
   legacy_vault::{self, LegacyEntry},
+  modules::vault::validation,
 };
 use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
@@ -120,11 +121,8 @@ async fn migrate_local_vault(
   let existing_folders = api_client
     .request(Method::GET, &api::vault::folders(&args.project), None)
     .await?;
-  if root_folder_exists(&existing_folders, root_name) {
-    bail!(
-      "a top-level folder named {root_name:?} already exists in project {:?}; choose a new --folder name",
-      args.project
-    );
+  if destination_exists(&existing_folders, root_name) {
+    bail!("{}", duplicate_folder_message(&args.project, root_name));
   }
 
   prompt::confirm(
@@ -144,7 +142,7 @@ async fn migrate_local_vault(
   let backup = expand_home(backup);
   create_verified_backup(&backup, &encrypted)?;
 
-  import_entries(&api_client, &args.project, root_name, &entries)
+  import_entries(&api_client, &args.project, root_name, &entries, &backup)
     .await
     .with_context(|| {
       format!(
@@ -194,19 +192,58 @@ fn expand_home(path: PathBuf) -> PathBuf {
   path
 }
 
-fn root_folder_exists(
+/// Reject an existing top-level folder whose name matches `name`.
+///
+/// The project root itself is not a valid destination name, so only children
+/// of that root are compared. `GET /files/folders` normally omits the root
+/// folder, which makes every top-level folder reference a `parentId` that is
+/// absent from the response; when the response does include the root
+/// (`isRoot: true`), its id is used instead. A response that carries neither
+/// falls through to the server's `VAULT_NAME_CONFLICT` guard.
+fn destination_exists(
   folders: &Value,
   name: &str,
 ) -> bool {
-  folders.as_array().is_some_and(|folders| {
-    folders.iter().any(|folder| {
-      folder.get("parentId").is_none_or(Value::is_null)
-        && folder
-          .get("name")
-          .and_then(Value::as_str)
-          .is_some_and(|existing| existing.eq_ignore_ascii_case(name.trim()))
-    })
+  let Some(folders) = folders.as_array() else {
+    return false;
+  };
+  let ids: HashSet<&str> = folders
+    .iter()
+    .filter_map(|folder| folder.get("id").and_then(Value::as_str))
+    .collect();
+  let roots: HashSet<&str> = folders
+    .iter()
+    .filter(|folder| folder.get("isRoot").and_then(Value::as_bool) == Some(true))
+    .filter_map(|folder| folder.get("id").and_then(Value::as_str))
+    .collect();
+  let name = name.trim();
+  folders.iter().any(|folder| {
+    if folder.get("isRoot").and_then(Value::as_bool) == Some(true) {
+      return false;
+    }
+    let Some(parent) = folder.get("parentId").and_then(Value::as_str) else {
+      return false;
+    };
+    let top_level = if roots.is_empty() {
+      !ids.contains(parent)
+    } else {
+      roots.contains(parent)
+    };
+    top_level
+      && folder
+        .get("name")
+        .and_then(Value::as_str)
+        .is_some_and(|existing| existing.eq_ignore_ascii_case(name))
   })
+}
+
+fn duplicate_folder_message(
+  project_ref: &str,
+  root_name: &str,
+) -> String {
+  format!(
+    "a top-level folder named {root_name:?} already exists in project {project_ref:?}; choose a new --folder name"
+  )
 }
 
 fn validate_import(
@@ -279,25 +316,15 @@ fn folder_segments(folder: &str) -> Result<Vec<String>> {
 }
 
 fn validate_folder_name(name: &str) -> Result<()> {
-  let name = name.trim();
-  if name.is_empty()
-    || name.len() > 128
-    || name == "."
-    || name == ".."
-    || name.contains('\0')
-    || name.contains('/')
-    || name.contains('\\')
-  {
-    bail!("folder names must be 1–128 bytes and cannot contain path separators");
-  }
-  Ok(())
+  validation::valid_name(name)
+    .map(|_| ())
+    .map_err(|reason| anyhow::anyhow!("folder names must be valid: {reason}"))
 }
 
 fn validate_file_name(name: &str) -> Result<()> {
-  if name.trim().is_empty() || name.trim().len() > 128 || name.contains('\0') {
-    bail!("file names must be 1–128 bytes");
-  }
-  Ok(())
+  validation::valid_name(name)
+    .map(|_| ())
+    .map_err(|reason| anyhow::anyhow!("file names must be valid: {reason}"))
 }
 
 fn create_verified_backup(
@@ -343,11 +370,18 @@ async fn import_entries(
   project_ref: &str,
   root_name: &str,
   entries: &[LegacyEntry],
+  backup: &Path,
 ) -> Result<()> {
   let mut created_folders = Vec::new();
   let mut created_files = Vec::new();
   let result = async {
-    let root = create_folder(api_client, project_ref, root_name, None).await?;
+    let root = match create_folder(api_client, project_ref, root_name, None).await {
+      Ok(root) => root,
+      Err(error) if client::is_conflict_error(&error) => {
+        bail!("{}", duplicate_folder_message(project_ref, root_name))
+      }
+      Err(error) => return Err(error),
+    };
     created_folders.push(root.clone());
     let mut folder_ids = HashMap::<String, String>::new();
     for entry in entries {
@@ -411,17 +445,44 @@ async fn import_entries(
   }
   .await;
   if let Err(error) = result {
+    if created_folders.is_empty() && created_files.is_empty() {
+      return Err(error);
+    }
     let cleanup_errors =
       rollback_created(api_client, project_ref, &created_files, &created_folders).await;
     if cleanup_errors.is_empty() {
       return Err(error).context("partial import was rolled back");
     }
     bail!(
-      "{error:#}; automatic rollback was incomplete: {}",
-      cleanup_errors.join("; ")
+      "{}",
+      rollback_failure_message(&error, root_name, backup, &cleanup_errors)
     );
   }
   Ok(())
+}
+
+/// Describe a failed import whose cleanup could not be completed.
+///
+/// Deletions are Admin UI only, so a CLI session cannot undo a partial import.
+/// The message must say so instead of implying the tree was removed.
+fn rollback_failure_message(
+  error: &anyhow::Error,
+  root_name: &str,
+  backup: &Path,
+  failures: &[CleanupFailure],
+) -> String {
+  let details = failures
+    .iter()
+    .map(|failure| failure.detail.as_str())
+    .collect::<Vec<_>>()
+    .join("; ");
+  if failures.iter().any(|failure| failure.forbidden) {
+    return format!(
+      "{error:#}; automatic rollback was refused by the server, so the destination folder {root_name:?} still exists with partially imported data and must be deleted in the Admin UI. The encrypted source backup is at {}. Failed cleanup requests: {details}",
+      backup.display()
+    );
+  }
+  format!("{error:#}; automatic rollback was incomplete: {details}")
 }
 
 async fn create_folder(
@@ -444,19 +505,27 @@ async fn create_folder(
     .context("Dopbase did not return a created folder id")
 }
 
+struct CleanupFailure {
+  detail: String,
+  forbidden: bool,
+}
+
 async fn rollback_created(
   api_client: &ApiClient,
   project_ref: &str,
   files: &[String],
   folders: &[String],
-) -> Vec<String> {
+) -> Vec<CleanupFailure> {
   let mut errors = Vec::new();
   for id in files.iter().rev() {
     if let Err(error) = api_client
       .request(Method::DELETE, &api::vault::file(project_ref, id), None)
       .await
     {
-      errors.push(format!("file {id}: {error}"));
+      errors.push(CleanupFailure {
+        detail: format!("file {id}: {error}"),
+        forbidden: client::is_forbidden_error(&error),
+      });
     }
   }
   for id in folders.iter().rev() {
@@ -464,8 +533,348 @@ async fn rollback_created(
       .request(Method::DELETE, &api::vault::folder(project_ref, id), None)
       .await
     {
-      errors.push(format!("folder {id}: {error}"));
+      errors.push(CleanupFailure {
+        detail: format!("folder {id}: {error}"),
+        forbidden: client::is_forbidden_error(&error),
+      });
     }
   }
   errors
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{
+    CleanupFailure, destination_exists, folder_segments, rollback_failure_message,
+    validate_file_name, validate_import,
+  };
+  use crate::{
+    legacy_vault::{LegacyEntry, LegacyVersion},
+    modules::vault::validation,
+  };
+  use serde_json::json;
+  use std::path::Path;
+  use zeroize::Zeroizing;
+
+  fn entry(
+    name: &str,
+    folder: &str,
+    kind: &str,
+  ) -> LegacyEntry {
+    LegacyEntry {
+      name: name.into(),
+      folder: folder.into(),
+      kind: kind.into(),
+      versions: vec![LegacyVersion {
+        version: 1,
+        encoding: "utf-8".into(),
+        content: Zeroizing::new("value".to_owned()),
+      }],
+    }
+  }
+
+  fn rejection(
+    entries: &[LegacyEntry],
+    root: &str,
+  ) -> String {
+    let error = validate_import(entries, root).expect_err("import should have been rejected");
+    format!("{error:#}")
+  }
+
+  #[test]
+  fn accepts_a_nested_hierarchy_and_returns_every_parent_folder() {
+    let entries = [
+      entry("deploy.sh", "Ops/Prod", "ssh"),
+      entry("notes.txt", "Ops", "file"),
+      entry("token", "Dev/Sub/Deeper", "api"),
+    ];
+    let mut hierarchy = validate_import(&entries, "Imported vault").unwrap();
+    let mut paths: Vec<_> = hierarchy.keys().cloned().collect();
+    paths.sort();
+    assert_eq!(
+      paths,
+      ["Dev", "Dev/Sub", "Dev/Sub/Deeper", "Ops", "Ops/Prod"]
+    );
+    assert_eq!(hierarchy.remove("Ops/Prod").unwrap(), ["Ops", "Prod"]);
+  }
+
+  #[test]
+  fn rejects_duplicate_file_identities_case_insensitively() {
+    let entries = [
+      entry("Deploy.sh", "Ops/Prod", "ssh"),
+      entry("deploy.sh", "ops/prod", "ssh"),
+    ];
+    assert!(
+      rejection(&entries, "Imported vault").contains("duplicate file names in the same folder"),
+      "same folder and name modulo case must collide"
+    );
+
+    let same_folder = [
+      entry("Deploy.sh", "Ops", "ssh"),
+      entry("DEPLOY.SH", "Ops", "file"),
+    ];
+    assert!(rejection(&same_folder, "Imported vault").contains("duplicate file names"));
+
+    let distinct = [
+      entry("Deploy.sh", "Ops", "ssh"),
+      entry("deploy.sh", "Dev", "ssh"),
+    ];
+    assert!(
+      validate_import(&distinct, "Imported vault").is_ok(),
+      "identical names in different folders are legal"
+    );
+  }
+
+  #[test]
+  fn rejects_path_separators_in_folder_names() {
+    assert!(
+      rejection(&[entry("a", "Ops", "secret")], "Imported/vault").contains("path separators"),
+      "the destination folder must not contain a separator"
+    );
+    assert!(
+      rejection(&[entry("a", "Ops", "secret")], "Imported\\vault").contains("path separators")
+    );
+    assert_eq!(
+      folder_segments("Ops\\Prod/Cluster").unwrap(),
+      ["Ops", "Prod", "Cluster"],
+      "entry folder paths are split into segments instead of rejected"
+    );
+  }
+
+  #[test]
+  fn rejects_dot_and_dot_dot_folder_segments() {
+    assert!(rejection(&[entry("a", ".", "secret")], "Imported").contains("folder names must be"));
+    assert!(
+      rejection(&[entry("a", "Ops/..", "secret")], "Imported").contains("folder names must be")
+    );
+    assert!(
+      rejection(&[entry("a", "Ops/./Prod", "secret")], "Imported").contains("folder names must be")
+    );
+    assert!(rejection(&[entry("a", "Ops", "secret")], "..").contains("folder names must be"));
+  }
+
+  #[test]
+  fn rejects_folder_paths_deeper_than_32_levels() {
+    let deep = vec!["a"; 33].join("/");
+    assert!(deep.chars().count() < 160, "depth must trip before length");
+    assert!(
+      rejection(&[entry("a", &deep, "secret")], "Imported").contains("exceeds 32 levels"),
+      "33 segments must be rejected"
+    );
+    let allowed = vec!["a"; 32].join("/");
+    assert!(validate_import(&[entry("a", &allowed, "secret")], "Imported").is_ok());
+  }
+
+  #[test]
+  fn rejects_folder_paths_longer_than_160_characters() {
+    let long = format!("{}/{}", "a".repeat(80), "b".repeat(80));
+    assert_eq!(long.chars().count(), 161);
+    assert!(
+      rejection(&[entry("a", &long, "secret")], "Imported").contains("exceeds 160 characters")
+    );
+    assert!(rejection(&[entry("a", "Ops", "secret")], &"n".repeat(129)).contains("folder names"));
+  }
+
+  #[test]
+  fn rejects_unsupported_entry_kinds() {
+    for kind in ["agent", "note", "", "Secret"] {
+      let error = rejection(&[entry("a", "Ops", kind)], "Imported");
+      assert!(
+        error.contains("unsupported type"),
+        "kind {kind:?} must be rejected: {error}"
+      );
+    }
+    for kind in ["secret", "ssh", "kubeconfig", "env", "api", "file"] {
+      assert!(
+        validate_import(&[entry("a", "Ops", kind)], "Imported").is_ok(),
+        "kind {kind:?} must be supported"
+      );
+    }
+  }
+
+  #[test]
+  fn rejects_invalid_file_names() {
+    for name in ["", "   ", "nul\0name"] {
+      let error = rejection(&[entry(name, "Ops", "secret")], "Imported");
+      assert!(
+        error.contains("file names must be"),
+        "name {name:?} must be rejected: {error}"
+      );
+    }
+    let long = "n".repeat(129);
+    assert!(rejection(&[entry(&long, "Ops", "secret")], "Imported").contains("file names must be"));
+  }
+
+  #[test]
+  fn rejects_an_empty_vault_and_unsupported_content() {
+    assert!(rejection(&[], "Imported").contains("no entries to import"));
+
+    let mut oversized = entry("a", "Ops", "secret");
+    oversized.versions[0].content = Zeroizing::new("a".repeat(1024 * 1024 + 1));
+    assert!(rejection(&[oversized], "Imported").contains("cannot store"));
+
+    let mut nul = entry("a", "Ops", "secret");
+    nul.versions[0].content = Zeroizing::new("before\0after".to_owned());
+    assert!(rejection(&[nul], "Imported").contains("cannot store"));
+  }
+
+  #[test]
+  fn rejects_dot_and_dot_dot_file_names() {
+    for name in [".", "..", "Ops/Prod", "Ops\\Prod", "nul\0name"] {
+      let error = rejection(&[entry(name, "Ops", "secret")], "Imported");
+      assert!(
+        error.contains("file names must be"),
+        "name {name:?} must be rejected before any write: {error}"
+      );
+    }
+    assert!(
+      validate_import(&[entry("..", "Ops", "secret")], "Imported").is_err(),
+      "dry-run validation must reject the same names the server rejects"
+    );
+  }
+
+  #[test]
+  fn file_name_validation_is_the_shared_vault_rule() {
+    let long = "n".repeat(129);
+    let longest = "n".repeat(128);
+    for name in [
+      "",
+      "  ",
+      ".",
+      "..",
+      "a/b",
+      "a\\b",
+      "nul\0name",
+      "ok.txt",
+      &longest,
+      &long,
+    ] {
+      assert_eq!(
+        validate_file_name(name).is_err(),
+        validation::valid_name(name).is_err(),
+        "importer and server must agree on {name:?}"
+      );
+    }
+    assert!(validate_file_name("ok.txt").is_ok());
+  }
+
+  #[test]
+  fn rejects_an_existing_top_level_folder_case_insensitively() {
+    let folders = json!([
+      {"id": "root", "isRoot": true, "parentId": null, "name": ""},
+      {"id": "f1", "isRoot": false, "parentId": "root", "name": "Imported Vault"},
+      {"id": "f2", "isRoot": false, "parentId": "f1", "name": "Ops"},
+    ]);
+    assert!(destination_exists(&folders, "Imported Vault"));
+    assert!(destination_exists(&folders, "imported vault"));
+    assert!(destination_exists(&folders, "  IMPORTED VAULT  "));
+    assert!(!destination_exists(&folders, "Imported"));
+  }
+
+  #[test]
+  fn allows_the_same_name_nested_deeper() {
+    let folders = json!([
+      {"id": "root", "isRoot": true, "parentId": null, "name": ""},
+      {"id": "f1", "isRoot": false, "parentId": "root", "name": "Ops"},
+      {"id": "f2", "isRoot": false, "parentId": "f1", "name": "Imported Vault"},
+    ]);
+    assert!(
+      !destination_exists(&folders, "Imported Vault"),
+      "only children of the project root can collide"
+    );
+  }
+
+  #[test]
+  fn allows_the_same_name_in_another_project() {
+    assert!(
+      !destination_exists(&json!([]), "Imported Vault"),
+      "another project's folders are not part of this project's response"
+    );
+    let other_tree = json!([
+      {"id": "elsewhere", "isRoot": false, "parentId": null, "name": "Imported Vault"},
+    ]);
+    assert!(
+      !destination_exists(&other_tree, "Imported Vault"),
+      "a folder outside the resolved root must not block the import"
+    );
+  }
+
+  #[test]
+  fn detects_top_level_folders_when_the_server_omits_the_root() {
+    // GET /files/folders hides the project root, so a top-level folder points
+    // at a parent id that is absent from the response.
+    let folders = json!([
+      {"id": "f1", "isRoot": false, "parentId": "unlisted-root", "name": "Imported Vault"},
+      {"id": "f2", "isRoot": false, "parentId": "f1", "name": "Imported Vault"},
+    ]);
+    assert!(destination_exists(&folders, "imported vault"));
+  }
+
+  #[test]
+  fn falls_through_when_the_response_has_no_root() {
+    assert!(!destination_exists(&json!([]), "Imported Vault"));
+    assert!(!destination_exists(
+      &json!({"unexpected": true}),
+      "Imported Vault"
+    ));
+    let nested_only = json!([
+      {"id": "a", "parentId": null, "name": "Ops"},
+      {"id": "b", "parentId": "a", "name": "Imported Vault"},
+    ]);
+    assert!(
+      !destination_exists(&nested_only, "Imported Vault"),
+      "without a root hint the server conflict stays the guard"
+    );
+  }
+
+  #[test]
+  fn reports_the_admin_ui_cleanup_requirement() {
+    let error = anyhow::anyhow!("could not import file \"notes.txt\"");
+    let failures = [CleanupFailure {
+      detail: "file 01: 403 Forbidden: AUTHORIZATION_DENIED: Admin UI only".into(),
+      forbidden: true,
+    }];
+    let message = rollback_failure_message(
+      &error,
+      "Imported vault",
+      Path::new("/tmp/local-vault-backup.vault"),
+      &failures,
+    );
+    assert!(
+      message.contains("still exists with partially imported data"),
+      "{message}"
+    );
+    assert!(
+      message.contains("must be deleted in the Admin UI"),
+      "{message}"
+    );
+    assert!(
+      message.contains("/tmp/local-vault-backup.vault"),
+      "the actionable message must name the encrypted backup: {message}"
+    );
+    assert!(
+      !message.contains("rolled back"),
+      "a refused rollback must never claim the tree was removed: {message}"
+    );
+  }
+
+  #[test]
+  fn keeps_reporting_other_cleanup_failures() {
+    let error = anyhow::anyhow!("boom");
+    let failures = [CleanupFailure {
+      detail: "file 01: 500 Internal Server Error".into(),
+      forbidden: false,
+    }];
+    let message = rollback_failure_message(
+      &error,
+      "Imported vault",
+      Path::new("/tmp/local-vault-backup.vault"),
+      &failures,
+    );
+    assert!(
+      message.contains("automatic rollback was incomplete: file 01: 500 Internal Server Error"),
+      "{message}"
+    );
+    assert!(!message.contains("Admin UI"), "{message}");
+  }
 }

@@ -15,7 +15,31 @@ All notable changes to Dopbase are documented in this file.
   point the user to the Admin UI instead.
 - The project files panel clears a stale clipboard error after a later copy
   succeeds.
+- `dopbase migrate local-vault` now rejects a destination folder already
+  present in the target project before creating a backup, compared
+  case-insensitively; the previous check could never match and the import
+  reached the server's conflict error. Folder and file names are validated
+  against the Vault name rule before the first write, matching the server
+  exactly, so a rejected name (including `.` and `..`) can no longer leave a
+  partial import behind. Vault deletions remain Admin-UI only; when the server
+  refuses the cleanup after a failed import, the error names the destination
+  folder and points at the Admin UI and the encrypted backup.
 - Documented the missing Vault folder, file, and file-reveal audit events.
+
+### Added
+
+- Automated coverage for the Local Vault importer: container-level tests for
+  `LVLT0001` parsing, revision history, encoding metadata, and the format's
+  rejection boundaries, and unit tests for the destination, name, and rollback
+  rules of `migrate local-vault`. No real vault material is used or committed.
+
+### Changed
+
+- Dependency refresh: rustls, rustls-webpki, webpki-roots, and tokio moved to
+  versions without open advisories, and `zip` moved from 2.2 to 9.1 for its
+  extraction advisories. The remaining audit findings are lockfile-only
+  (`rsa` via the disabled SQLx MySQL driver) or build-time
+  (`zip` 3 via `utoipa-swagger-ui 9`, fixed only in its next major).
 
 ## 0.1.9 - 2026-10-07
 

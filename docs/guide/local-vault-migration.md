@@ -22,10 +22,19 @@ dopbase migrate local-vault \
 ```
 
 The backup path must not already exist. Dopbase creates it with owner-only
-permissions and verifies its bytes before sending values to the server. An
-existing destination folder is rejected. If an API request fails, the CLI
-tries to remove the folders and files it created; it keeps the source and the
-encrypted backup either way.
+permissions and verifies its bytes before sending values to the server. Every
+entry and folder name is checked against the Vault name rule before any write,
+so dry-run and a real import reject the same names (including `.` and `..`).
+Before writing, the CLI also rejects a destination folder that already exists
+as a top-level folder of the project, compared case-insensitively.
+
+Deleting Vault folders and files is an Admin UI operation, so the CLI cannot
+undo a partial import. If an API request fails after writing began, the CLI
+tries to remove what it created; when the server refuses those deletions, the
+error names the destination folder, states that it still contains partially
+imported data, and points at the encrypted backup. Delete that folder in the
+Admin UI and import again under a new `--folder` name. The source file and the
+encrypted backup are never modified.
 
 Legacy folder paths become nested folders. SSH, Kubernetes, environment, and
 generic file entries retain their matching type; API entries become generic

@@ -1,6 +1,7 @@
 use super::{
   model::*,
   repository::{self, VaultFileRow},
+  validation,
 };
 use crate::{
   extractors::{
@@ -55,19 +56,12 @@ pub async fn authorize_project_write(
 }
 
 fn valid_name(name: &str) -> Result<String, HttpError> {
-  let name = name.trim();
-  if name.is_empty()
-    || name.len() > 128
-    || name.chars().any(|value| matches!(value, '/' | '\\' | '\0'))
-    || name == "."
-    || name == ".."
-  {
-    return Err(HttpError::validation(std::collections::BTreeMap::from([(
+  validation::valid_name(name).map_err(|reason| {
+    HttpError::validation(std::collections::BTreeMap::from([(
       "VAULT_NAME_INVALID".into(),
-      "Names must be 1–128 bytes and cannot contain path separators.".into(),
-    )])));
-  }
-  Ok(name.to_string())
+      reason.into(),
+    )]))
+  })
 }
 
 fn valid_content(content: &str) -> Result<(), HttpError> {
@@ -847,4 +841,25 @@ pub async fn delete_file(
   .await?;
   tx.commit().await?;
   Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::valid_name;
+  use crate::modules::vault::validation::NAME_INVALID_MESSAGE;
+  use axum::http::StatusCode;
+
+  #[test]
+  fn name_rule_is_the_shared_vault_validation() {
+    for name in [".", "..", "Ops/Prod", "Ops\\Prod", "nul\0name", "", "  "] {
+      let error = valid_name(name).expect_err("name must be rejected");
+      assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+      assert_eq!(
+        error.errors.get("VAULT_NAME_INVALID").map(String::as_str),
+        Some(NAME_INVALID_MESSAGE),
+        "name {name:?} must keep the documented code and message"
+      );
+    }
+    assert_eq!(valid_name("  deploy.sh  ").unwrap(), "deploy.sh");
+  }
 }

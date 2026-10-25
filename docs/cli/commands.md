@@ -127,12 +127,17 @@ automation. No other command contacts GitHub.
 
 `dopbase migrate local-vault` imports the retired encrypted `LVLT0001` file
 into the Dopbase Vault tree. It asks for the old password without echo, refuses
-an existing destination folder, and never modifies the source. An actual import
-requires a new backup path; the CLI writes the encrypted file there with
-owner-only permissions and verifies its contents before importing.
+an existing destination folder (compared case-insensitively), and never
+modifies the source. An actual import requires a new backup path; the CLI
+writes the encrypted file there with owner-only permissions and verifies its
+contents before importing.
 
-Use `--dry-run` to validate the file and preview counts before importing. Value
-revisions and nested folder paths are preserved. See the
+Use `--dry-run` to validate the file and preview counts before importing. Names
+are checked against the Vault name rule before any write, so a rejected name
+never reaches the server. Vault deletions are Admin UI only: if an API request
+fails after writing began, the CLI tries to remove what it created, and a
+refused cleanup tells you to delete the destination folder in the Admin UI
+instead. Value revisions and nested folder paths are preserved. See the
 [Local Vault migration guide](/guide/local-vault-migration) for type mappings,
 base64 behavior, and limitations.
 
