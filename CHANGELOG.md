@@ -2,87 +2,106 @@
 
 All notable changes to Dopbase are documented in this file.
 
-## Unreleased
+## 0.2.0 - 2026-10-25
 
-### Fixed
-
-- `dopbase files <PROJECT> file reveal` uses an authenticated project-manager
-  session instead of asking for an interactive password confirmation the
-  server never required for project files. Secret-value reveal and export still
-  require recent password authentication.
-- The AI-agent MCP instructions state that secret and project-file contents are
-  never returned and that the administrator password cannot unlock them, and
-  point the user to the Admin UI instead.
-- The project files panel clears a stale clipboard error after a later copy
-  succeeds.
-- `dopbase migrate local-vault` now rejects a destination folder already
-  present in the target project before creating a backup, compared
-  case-insensitively; the previous check could never match and the import
-  reached the server's conflict error. Folder and file names are validated
-  against the Vault name rule before the first write, matching the server
-  exactly, so a rejected name (including `.` and `..`) can no longer leave a
-  partial import behind.
-- Documented the missing Vault folder, file, and file-reveal audit events.
-- Backup restore deleted Vault folders, files, file versions, and archived
-  secret versions without restoring them from the snapshot. Restore now removes
-  the Vault tree leaf-first and restores every folder, file, revision, and
-  archived secret version the backup holds. Factory reset removes the same rows
-  explicitly.
-- A master-key rekey only re-wrapped data keys for environment secrets.
-  Archived secret versions, Vault files, and archived Vault file revisions
-  stayed encrypted under the old key, so restoring a re-keyed backup lost
-  access to them. Rekey now re-wraps every encrypted row and fails the whole
-  operation instead of skipping a row it cannot unwrap.
-- `GET /files/tree` created the project root folder on every read. The
-  endpoint is now read-only: a project without a root returns an empty tree,
-  and the first folder or file mutation provisions the root.
-- The Local Vault importer reopened the backup path to verify the ciphertext,
-  so a path swap between write and read could pass verification. Verification
-  now reads the bytes back through the same descriptor and fsyncs the parent
-  directory before the import starts.
-- The legacy container reader now rejects an entry with more than 1000
-  revisions before the confirmation prompt and before the backup is written,
-  matching the server limit.
+[Dopbase](https://dopbase.com) 0.2.0 imports a Local Vault in one atomic
+request, keeps Vault files and archived secret versions through backup restore
+and master-key changes, and hardens the importer against unsafe names,
+unverified backups, and oversized containers. Project files reveal with an
+authenticated session, and Vault names reject control characters.
 
 ### Added
+
+- `POST /api/v1/projects/{project_ref}/files/import` imports a folder tree with
+  its file revisions in one request and one database transaction. It accepts up
+  to 1000 entries, 1000 revisions per entry, 5000 revisions in total, 1 MiB per
+  revision, and 32 MiB in total, records one `vault.import.completed` audit
+  event, and returns `400` for an invalid payload or `409` when the destination
+  folder already exists.
 
 - `vault.file.rolled_back` records a Vault file rollback with `fromVersion` and
   `toVersion`. A rollback emits this event instead of `vault.file.updated`.
 
-- `dopbase migrate local-vault --insecure-transport` allows an import over
-  plain HTTP. Without the flag, plain HTTP to any host other than `localhost`,
-  a loopback IPv4 address, or `::1` is refused before the vault is read or the
-  password is prompted; the flag prints a warning on stderr.
+### Improvement
+
+- `dopbase migrate local-vault` sends the whole import as a single request to
+  the new import endpoint instead of one request per folder and file. A failed
+  import writes nothing, so no partial data is left to clean up.
+
+- Vault folder and file names reject control characters in addition to path
+  separators. The rule is shared by the HTTP API and `migrate local-vault`, so
+  both accept exactly the same names, and the rejection message says names
+  cannot contain path separators or control characters.
+
+- Project references resolve by ID first and by name second, so a project named
+  like another project's ID can no longer capture an ID-addressed lookup.
+
+- Dependency refresh: rustls, rustls-webpki, webpki-roots, and tokio moved to
+  versions without open advisories, and `zip` moved from 2.2 to 9.1 for its
+  extraction advisories. Frontend dependencies moved to their current releases,
+  and the repository pins `bun@1.4.4` as its package manager. The remaining
+  audit findings are lockfile-only (`rsa` via the disabled SQLx MySQL driver) or
+  build-time (`zip` 3 via `utoipa-swagger-ui 9`, fixed only in its next major).
 
 - Automated coverage for the Local Vault importer: container-level tests for
   `LVLT0001` parsing, revision history, encoding metadata, and the format's
   rejection boundaries, and unit tests for the destination, name, and rollback
   rules of `migrate local-vault`. No real vault material is used or committed.
-- `POST /api/v1/projects/{project_ref}/files/import` imports a folder tree with
-  its file revisions in one request and one database transaction. It accepts up
-  to 1000 entries, 1000 revisions per entry, 1 MiB per revision, and 32 MiB in
-  total, records one `vault.import.completed` audit event, and returns `400`
-  for an invalid payload or `409` when the destination folder already exists.
 
-### Changed
+### Fixed
 
-- `dopbase migrate local-vault` sends the whole import as a single request to
-  the new import endpoint instead of one request per folder and file. A failed
-  import writes nothing, so no partial data is left to clean up.
-- Dependency refresh: rustls, rustls-webpki, webpki-roots, and tokio moved to
-  versions without open advisories, and `zip` moved from 2.2 to 9.1 for its
-  extraction advisories. The remaining audit findings are lockfile-only
-  (`rsa` via the disabled SQLx MySQL driver) or build-time
-  (`zip` 3 via `utoipa-swagger-ui 9`, fixed only in its next major).
-- Vault folder and file names reject control characters in addition to path
-  separators. The rule is shared by the HTTP API and `migrate local-vault`, and
-  the rejection message now says names cannot contain path separators or
-  control characters.
-- Vault imports are also capped at 5000 revisions across all files in one
-  import, in addition to 1000 entries and 1000 revisions per entry.
-- Project references resolve by ID first and by name second, so a project
-  named like another project's ID can no longer capture an ID-addressed
-  lookup.
+- `dopbase files <PROJECT> file reveal` uses an authenticated project-manager
+  session instead of asking for an interactive password confirmation the server
+  never required for project files. Secret-value reveal and export still
+  require recent password authentication.
+
+- The AI-agent MCP instructions state that secret and project-file contents are
+  never returned and that the administrator password cannot unlock them, and
+  point the user to the Admin UI instead.
+
+- The project files panel clears a stale clipboard error after a later copy
+  succeeds.
+
+- `GET /files/tree` created the project root folder on every read. The endpoint
+  is now read-only: a project without a root returns an empty tree, and the
+  first folder or file mutation provisions the root.
+
+- Backup restore deleted Vault folders, files, file versions, and archived
+  secret versions without restoring them from the snapshot. Restore now removes
+  the Vault tree leaf-first and restores every folder, file, revision, and
+  archived secret version the backup holds. Factory reset removes the same rows
+  explicitly.
+
+- A master-key rekey only re-wrapped data keys for environment secrets.
+  Archived secret versions, Vault files, and archived Vault file revisions
+  stayed encrypted under the old key, so restoring a re-keyed backup lost access
+  to them. Rekey now re-wraps every encrypted row and fails the whole operation
+  instead of skipping a row it cannot unwrap.
+
+- `dopbase migrate local-vault` now rejects a destination folder already present
+  in the target project before creating a backup, compared case-insensitively.
+  The previous check could never match, so the import reached the server's
+  conflict error.
+
+- The importer validates folder and file names against the Vault name rule
+  before the first write, matching the server exactly, so a rejected name
+  (including `.` and `..`) can no longer leave a partial import behind. The
+  legacy container reader also rejects an entry with more than 1000 revisions
+  before the confirmation prompt and before the backup is written.
+
+- Documented the missing Vault folder, file, and file-reveal audit events.
+
+### Security
+
+- `dopbase migrate local-vault` refuses plain HTTP to any host other than
+  `localhost`, a loopback IPv4 address, or `::1` before the vault is read or the
+  password is prompted. The new `--insecure-transport` flag opts in to an
+  import over plain HTTP and prints a warning on stderr.
+
+- The Local Vault importer reopened the backup path to verify the ciphertext, so
+  a path swap between write and read could pass verification. Verification now
+  reads the bytes back through the same descriptor and fsyncs the parent
+  directory before the import starts.
 
 ## 0.1.9 - 2026-10-07
 
