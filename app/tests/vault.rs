@@ -69,6 +69,34 @@ async fn call(
   )
 }
 
+async fn admin_session(
+  router: &Router,
+  state: &app::state::AppState,
+) -> (String, String) {
+  let setup_token = state.setup.read().await.token.clone().unwrap();
+  let (status, bootstrap, headers) = call(
+    router,
+    "POST",
+    "/api/v1/bootstrap/admin",
+    None,
+    None,
+    Some(json!({"setupToken":setup_token,"email":"root@example.com","password":"fixture-password-123"})),
+  )
+  .await;
+  assert_eq!(status, 201, "{bootstrap}");
+  let cookie = headers
+    .get(header::SET_COOKIE)
+    .unwrap()
+    .to_str()
+    .unwrap()
+    .split(';')
+    .next()
+    .unwrap()
+    .to_owned();
+  let csrf = bootstrap["data"]["csrfToken"].as_str().unwrap().to_owned();
+  (cookie, csrf)
+}
+
 async fn run_cli(
   url: String,
   token: String,
@@ -368,6 +396,20 @@ async fn encrypted_files_keep_versions_and_agent_tokens_cannot_reveal_or_write()
   .await;
   assert_eq!(status, 200);
   assert_eq!(rolled_back["data"]["version"], 3);
+  let rollback_events: Vec<(String,)> = sqlx::query_as(
+    "SELECT metadata FROM audit_events WHERE action='vault.file.rolled_back' AND resource_id=?",
+  )
+  .bind(&file_id)
+  .fetch_all(state.db.pool())
+  .await
+  .unwrap();
+  assert_eq!(
+    rollback_events.len(),
+    1,
+    "a rollback must record its own audit event"
+  );
+  let rollback_metadata: Value = serde_json::from_str(&rollback_events[0].0).unwrap();
+  assert_eq!(rollback_metadata, json!({"fromVersion":1,"toVersion":3}));
   let (status, restored, _) = call(
     &router,
     "POST",
@@ -889,4 +931,240 @@ async fn encrypted_files_keep_versions_and_agent_tokens_cannot_reveal_or_write()
   let _ = server.await;
 
   state.db.close().await;
+}
+
+async fn vault_row_counts(
+  state: &app::state::AppState,
+  project_id: &str,
+) -> (i64, i64) {
+  let folders: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vault_folders WHERE project_id=?")
+    .bind(project_id)
+    .fetch_one(state.db.pool())
+    .await
+    .unwrap();
+  let files: i64 = sqlx::query_scalar(
+    "SELECT COUNT(*) FROM vault_files WHERE folder_id IN (SELECT id FROM vault_folders WHERE project_id=?)",
+  )
+  .bind(project_id)
+  .fetch_one(state.db.pool())
+  .await
+  .unwrap();
+  (folders, files)
+}
+
+#[tokio::test]
+async fn tree_does_not_provision_the_project_root() {
+  let (_directory, state, router) = fixture().await;
+  let (cookie, csrf) = admin_session(&router, &state).await;
+  let (status, project, _) = call(
+    &router,
+    "POST",
+    "/api/v1/projects",
+    Some(&cookie),
+    Some(&csrf),
+    Some(json!({"name":"read-only-tree"})),
+  )
+  .await;
+  assert_eq!(status, 201, "{project}");
+  let project_id = project["data"]["id"].as_str().unwrap().to_owned();
+  let before = vault_row_counts(&state, &project_id).await;
+  assert_eq!(before, (0, 0), "a new project has no Vault rows");
+
+  let (status, tree, _) = call(
+    &router,
+    "GET",
+    &format!("/api/v1/projects/{project_id}/files/tree"),
+    Some(&cookie),
+    None,
+    None,
+  )
+  .await;
+  assert_eq!(status, 200, "{tree}");
+  assert_eq!(
+    tree["data"],
+    json!([]),
+    "a project without a root has an empty tree"
+  );
+
+  let (status, folders, _) = call(
+    &router,
+    "GET",
+    &format!("/api/v1/projects/{project_id}/files/folders"),
+    Some(&cookie),
+    None,
+    None,
+  )
+  .await;
+  assert_eq!(status, 200, "{folders}");
+  assert_eq!(folders["data"], json!([]));
+  assert_eq!(
+    vault_row_counts(&state, &project_id).await,
+    before,
+    "reading the tree must not create the project root"
+  );
+}
+
+#[tokio::test]
+async fn project_references_prefer_the_id_over_a_name() {
+  let (_directory, state, router) = fixture().await;
+  let (cookie, csrf) = admin_session(&router, &state).await;
+  let (status, first, _) = call(
+    &router,
+    "POST",
+    "/api/v1/projects",
+    Some(&cookie),
+    Some(&csrf),
+    Some(json!({"name":"named-project"})),
+  )
+  .await;
+  assert_eq!(status, 201, "{first}");
+  let id = first["data"]["id"].as_str().unwrap().to_owned();
+  let (status, folder, _) = call(
+    &router,
+    "POST",
+    &format!("/api/v1/projects/{id}/files/folders"),
+    Some(&cookie),
+    Some(&csrf),
+    Some(json!({"name":"owned-by-id"})),
+  )
+  .await;
+  assert_eq!(status, 201, "{folder}");
+
+  // A project may legally carry another project's ID as its name.
+  let (status, second, _) = call(
+    &router,
+    "POST",
+    "/api/v1/projects",
+    Some(&cookie),
+    Some(&csrf),
+    Some(json!({"name": id})),
+  )
+  .await;
+  assert_eq!(status, 201, "{second}");
+  let second_id = second["data"]["id"].as_str().unwrap().to_owned();
+  assert_ne!(second_id, id);
+
+  let (status, resolved, _) = call(
+    &router,
+    "GET",
+    &format!("/api/v1/projects/{id}"),
+    Some(&cookie),
+    None,
+    None,
+  )
+  .await;
+  assert_eq!(status, 200, "{resolved}");
+  assert_eq!(resolved["data"]["id"], id);
+  assert_eq!(resolved["data"]["name"], "named-project");
+
+  let (status, tree, _) = call(
+    &router,
+    "GET",
+    &format!("/api/v1/projects/{id}/files/tree"),
+    Some(&cookie),
+    None,
+    None,
+  )
+  .await;
+  assert_eq!(status, 200, "{tree}");
+  assert!(
+    tree["data"]
+      .as_array()
+      .unwrap()
+      .iter()
+      .any(|entry| entry["folder"]["name"] == "owned-by-id"),
+    "the ID must address the project it belongs to: {tree}"
+  );
+
+  let (status, other, _) = call(
+    &router,
+    "GET",
+    &format!("/api/v1/projects/{second_id}/files/tree"),
+    Some(&cookie),
+    None,
+    None,
+  )
+  .await;
+  assert_eq!(status, 200, "{other}");
+  assert_eq!(other["data"], json!([]));
+}
+
+#[tokio::test]
+async fn control_characters_are_rejected_in_vault_names() {
+  let (_directory, state, router) = fixture().await;
+  let (cookie, csrf) = admin_session(&router, &state).await;
+  let (status, project, _) = call(
+    &router,
+    "POST",
+    "/api/v1/projects",
+    Some(&cookie),
+    Some(&csrf),
+    Some(json!({"name":"control-chars"})),
+  )
+  .await;
+  assert_eq!(status, 201, "{project}");
+  let project_id = project["data"]["id"].as_str().unwrap().to_owned();
+
+  let (status, body, _) = call(
+    &router,
+    "POST",
+    &format!("/api/v1/projects/{project_id}/files/folders"),
+    Some(&cookie),
+    Some(&csrf),
+    Some(json!({"name":"ansi\u{1b}[31mred"})),
+  )
+  .await;
+  assert_eq!(status, 422, "{body}");
+  let message = body["error"]["VAULT_NAME_INVALID"]
+    .as_str()
+    .unwrap_or_else(|| panic!("expected VAULT_NAME_INVALID: {body}"));
+  assert!(message.contains("control characters"), "{message}");
+
+  let (status, folder, _) = call(
+    &router,
+    "POST",
+    &format!("/api/v1/projects/{project_id}/files/folders"),
+    Some(&cookie),
+    Some(&csrf),
+    Some(json!({"name":"safe"})),
+  )
+  .await;
+  assert_eq!(status, 201, "{folder}");
+  let folder_id = folder["data"]["id"].as_str().unwrap();
+  let (status, body, _) = call(
+    &router,
+    "POST",
+    &format!("/api/v1/projects/{project_id}/files/folders/{folder_id}/files"),
+    Some(&cookie),
+    Some(&csrf),
+    Some(json!({"name":"line\nbreak","kind":"text","content":"value","encoding":"utf-8"})),
+  )
+  .await;
+  assert_eq!(status, 422, "{body}");
+  assert!(body["error"]["VAULT_NAME_INVALID"].is_string(), "{body}");
+
+  let (status, body, _) = call(
+    &router,
+    "PUT",
+    &format!("/api/v1/projects/{project_id}/files/folders/{folder_id}"),
+    Some(&cookie),
+    Some(&csrf),
+    Some(json!({"name":"tab\tname"})),
+  )
+  .await;
+  assert_eq!(status, 422, "{body}");
+  assert!(body["error"]["VAULT_NAME_INVALID"].is_string(), "{body}");
+
+  let files: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vault_files WHERE folder_id=?")
+    .bind(folder_id)
+    .fetch_one(state.db.pool())
+    .await
+    .unwrap();
+  assert_eq!(files, 0);
+  let renamed: String = sqlx::query_scalar("SELECT name FROM vault_folders WHERE id=?")
+    .bind(folder_id)
+    .fetch_one(state.db.pool())
+    .await
+    .unwrap();
+  assert_eq!(renamed, "safe");
 }

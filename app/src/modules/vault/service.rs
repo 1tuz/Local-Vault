@@ -21,6 +21,9 @@ use ulid::Ulid;
 const MAX_FILE_BYTES: usize = 1024 * 1024;
 const MAX_IMPORT_ENTRIES: usize = 1000;
 const MAX_IMPORT_VERSIONS: usize = 1000;
+/// Total revisions across every entry. Empty revisions cost no bytes, so the
+/// content budget alone cannot bound the rows written by one import.
+const MAX_IMPORT_TOTAL_VERSIONS: usize = 5000;
 const MAX_IMPORT_TOTAL_BYTES: usize = 32 * 1024 * 1024;
 const MAX_IMPORT_FOLDER_PATH_CHARS: usize = 160;
 const MAX_IMPORT_FOLDER_DEPTH: usize = 32;
@@ -35,7 +38,10 @@ fn audit_actor(identity: &AuthIdentity) -> (&'static str, &str, Option<&str>) {
       name,
       ..
     } => ("ai_agent", service_account_id, Some(name)),
-    _ => unreachable!("project file writes require an admin or project token"),
+    _ => {
+      tracing::warn!("project file write reached an unexpected identity");
+      ("unknown", "", None)
+    }
   }
 }
 
@@ -98,11 +104,21 @@ fn valid_encoding(
 }
 
 fn db_error(error: sqlx::Error) -> HttpError {
-  if matches!(&error, sqlx::Error::Database(_)) {
-    name_conflict()
-  } else {
-    HttpError::from(error)
+  if let sqlx::Error::Database(database) = &error {
+    // SQLite reports a sibling-name conflict either as
+    // "UNIQUE constraint failed: vault_files.folder_id, vault_files.name" or,
+    // for the expression index on folders, as
+    // "UNIQUE constraint failed: index 'vault_folders_sibling_name_idx'".
+    // Every other constraint (primary key, foreign key, CHECK, BUSY, ...) is
+    // a real server error and must not be reported as a name conflict.
+    let message = database.message();
+    if database.is_unique_violation()
+      && (message.contains(".name") || message.contains("vault_folders_sibling_name_idx"))
+    {
+      return name_conflict();
+    }
   }
+  HttpError::from(error)
 }
 
 fn name_conflict() -> HttpError {
@@ -145,15 +161,9 @@ pub async fn tree(
 ) -> Result<Vec<VaultFolderContents>, HttpError> {
   let project_id = resolve_project(state, project_ref).await?;
   require_project_access(identity, &project_id)?;
-  let mut tx = state.db.pool().begin_with("BEGIN IMMEDIATE").await?;
-  repository::ensure_project_root(
-    &mut tx,
-    &project_id,
-    &Ulid::new().to_string(),
-    &Utc::now().to_rfc3339(),
-  )
-  .await?;
-  tx.commit().await?;
+  // Reads never provision the project root: `create_folder`, `move_folder`
+  // and `import` do that inside their write transactions. A project that has
+  // no root yet simply has an empty tree.
   let mut folders = repository::folders(state.db.pool(), &project_id).await?;
   for folder in &mut folders {
     if folder.is_root {
@@ -658,9 +668,25 @@ pub async fn update_file(
 ) -> Result<VaultFileMetadata, HttpError> {
   let project_id = resolve_project(state, project_ref).await?;
   require_project_write(identity, &project_id)?;
+  apply_file_update(state, identity, &project_id, id, request, None).await
+}
+
+/// Store a new current version of a file.
+///
+/// `rollback_from` is the archived version whose content is being restored.
+/// It only selects the audit event, so a rollback stays distinguishable from
+/// an ordinary edit.
+async fn apply_file_update(
+  state: &AppState,
+  identity: &AuthIdentity,
+  project_id: &str,
+  id: &str,
+  request: UpdateVaultFileRequest,
+  rollback_from: Option<i64>,
+) -> Result<VaultFileMetadata, HttpError> {
   valid_content(&request.content)?;
   let mut tx = state.db.pool().begin_with("BEGIN IMMEDIATE").await?;
-  let previous = repository::file_tx(&mut tx, &project_id, id)
+  let previous = repository::file_tx(&mut tx, project_id, id)
     .await?
     .ok_or_else(|| HttpError::not_found("VAULT_FILE_NOT_FOUND", "The file was not found."))?;
   let encoding = valid_encoding(
@@ -676,17 +702,24 @@ pub async fn update_file(
     .map_err(|_| HttpError::internal())?;
   repository::update_file(&mut tx, id, version, &encrypted, &encoding, &now).await?;
   let (actor_type, actor_id, actor_label) = audit_actor(identity);
+  let (action, metadata) = match rollback_from {
+    Some(from_version) => (
+      "vault.file.rolled_back",
+      serde_json::json!({"fromVersion":from_version,"toVersion":version}),
+    ),
+    None => ("vault.file.updated", serde_json::json!({"version":version})),
+  };
   common::audit(
     &mut *tx,
     actor_type,
     Some(actor_id),
     actor_label,
-    "vault.file.updated",
-    Some(&project_id),
+    action,
+    Some(project_id),
     None,
     Some("vault_file"),
     Some(id),
-    serde_json::json!({"version":version}),
+    metadata,
   )
   .await?;
   tx.commit().await?;
@@ -775,15 +808,16 @@ pub async fn rollback_file(
       HttpError::not_found("VAULT_VERSION_NOT_FOUND", "The file version was not found.")
     })?;
   let content = decrypt(state, &row)?;
-  update_file(
+  apply_file_update(
     state,
     identity,
-    project_ref,
+    &project_id,
     id,
     UpdateVaultFileRequest {
       content,
       encoding: Some(row.encoding),
     },
+    Some(version),
   )
   .await
 }
@@ -899,6 +933,7 @@ fn plan_import(request: ImportVaultRequest) -> Result<ImportPlan, HttpError> {
   let mut identities = HashMap::<String, ()>::new();
   let mut files = Vec::<PlannedFile>::new();
   let mut total_bytes = 0_usize;
+  let mut total_versions = 0_usize;
   for entry in request.entries {
     let name = validation::valid_name(&entry.name).map_err(|reason| {
       import_invalid(format!("File name {:?} is invalid: {reason}", entry.name))
@@ -936,6 +971,12 @@ fn plan_import(request: ImportVaultRequest) -> Result<ImportPlan, HttpError> {
         "File {name:?} has more than {MAX_IMPORT_VERSIONS} revisions."
       )));
     }
+    total_versions += entry.versions.len();
+    if total_versions > MAX_IMPORT_TOTAL_VERSIONS {
+      return Err(import_invalid(format!(
+        "An import can contain at most {MAX_IMPORT_TOTAL_VERSIONS} revisions across all files."
+      )));
+    }
     let mut versions = Vec::with_capacity(entry.versions.len());
     for version in entry.versions {
       if version.content.len() > MAX_FILE_BYTES || version.content.contains('\0') {
@@ -960,7 +1001,7 @@ fn plan_import(request: ImportVaultRequest) -> Result<ImportPlan, HttpError> {
       versions,
     });
   }
-  let versions = files.iter().map(|file| file.versions.len()).sum();
+  let versions = total_versions;
   Ok(ImportPlan {
     root_name,
     folders,
@@ -1146,13 +1187,30 @@ pub async fn import(
 
 #[cfg(test)]
 mod tests {
-  use super::valid_name;
-  use crate::modules::vault::validation::NAME_INVALID_MESSAGE;
+  use super::{MAX_IMPORT_TOTAL_VERSIONS, db_error, plan_import, valid_name};
+  use crate::modules::vault::{
+    model::{ImportEntry, ImportVaultRequest, ImportVersion, VaultFileKind},
+    validation::NAME_INVALID_MESSAGE,
+  };
   use axum::http::StatusCode;
+  use sqlx::Connection as _;
+  use std::time::Duration;
 
   #[test]
   fn name_rule_is_the_shared_vault_validation() {
-    for name in [".", "..", "Ops/Prod", "Ops\\Prod", "nul\0name", "", "  "] {
+    for name in [
+      ".",
+      "..",
+      "Ops/Prod",
+      "Ops\\Prod",
+      "nul\0name",
+      "",
+      "  ",
+      "ansi\u{1b}[31mred",
+      "tab\tname",
+      "line\nbreak",
+      "osc\u{1b}]0;title\u{7}name",
+    ] {
       let error = valid_name(name).expect_err("name must be rejected");
       assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
       assert_eq!(
@@ -1162,5 +1220,190 @@ mod tests {
       );
     }
     assert_eq!(valid_name("  deploy.sh  ").unwrap(), "deploy.sh");
+    assert_eq!(valid_name("release notes.md").unwrap(), "release notes.md");
+  }
+
+  fn import_request(
+    entries: usize,
+    versions: usize,
+  ) -> ImportVaultRequest {
+    ImportVaultRequest {
+      folder: "Import".into(),
+      entries: (0..entries)
+        .map(|index| ImportEntry {
+          name: format!("file-{index}.txt"),
+          folder: String::new(),
+          kind: VaultFileKind::Text,
+          versions: (0..versions)
+            .map(|_| ImportVersion {
+              encoding: "utf-8".into(),
+              content: String::new(),
+            })
+            .collect(),
+        })
+        .collect(),
+    }
+  }
+
+  #[test]
+  fn import_revision_cap_is_enforced_before_any_work() {
+    let per_file = MAX_IMPORT_TOTAL_VERSIONS / 5;
+    let Ok(plan) = plan_import(import_request(5, per_file)) else {
+      panic!("an import at exactly the revision cap must be accepted");
+    };
+    assert_eq!(plan.versions, MAX_IMPORT_TOTAL_VERSIONS);
+
+    let Err(error) = plan_import(import_request(6, per_file)) else {
+      panic!("an import above the revision cap must be rejected");
+    };
+    assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    let message = &error.errors["VAULT_IMPORT_INVALID"];
+    assert!(
+      message.contains(&MAX_IMPORT_TOTAL_VERSIONS.to_string()),
+      "the rejection must name the limit: {message}"
+    );
+    assert!(message.contains("revisions"), "{message}");
+  }
+
+  #[tokio::test]
+  async fn only_name_conflicts_map_to_a_conflict_response() {
+    let mut connection = sqlx::SqliteConnection::connect("sqlite::memory:")
+      .await
+      .unwrap();
+    sqlx::query(
+      "CREATE TABLE vault_folders(id TEXT PRIMARY KEY, project_id TEXT NOT NULL, parent_id TEXT, name TEXT NOT NULL)",
+    )
+    .execute(&mut connection)
+    .await
+    .unwrap();
+    sqlx::query(
+      "CREATE UNIQUE INDEX vault_folders_sibling_name_idx ON vault_folders(project_id, COALESCE(parent_id,''), name COLLATE NOCASE)",
+    )
+    .execute(&mut connection)
+    .await
+    .unwrap();
+    sqlx::query(
+      "CREATE TABLE vault_files(id TEXT PRIMARY KEY, folder_id TEXT NOT NULL, name TEXT NOT NULL, UNIQUE(folder_id, name COLLATE NOCASE))",
+    )
+    .execute(&mut connection)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO vault_folders VALUES('f1','p',NULL,'Ops')")
+      .execute(&mut connection)
+      .await
+      .unwrap();
+    sqlx::query("INSERT INTO vault_files VALUES('a','f1','deploy.sh')")
+      .execute(&mut connection)
+      .await
+      .unwrap();
+
+    let folder_conflict = db_error(
+      sqlx::query("INSERT INTO vault_folders VALUES('f2','p',NULL,'ops')")
+        .execute(&mut connection)
+        .await
+        .unwrap_err(),
+    );
+    assert_eq!(folder_conflict.status, StatusCode::CONFLICT);
+    assert!(folder_conflict.errors.contains_key("VAULT_NAME_CONFLICT"));
+
+    let file_conflict = db_error(
+      sqlx::query("INSERT INTO vault_files VALUES('b','f1','DEPLOY.SH')")
+        .execute(&mut connection)
+        .await
+        .unwrap_err(),
+    );
+    assert_eq!(file_conflict.status, StatusCode::CONFLICT);
+    assert!(file_conflict.errors.contains_key("VAULT_NAME_CONFLICT"));
+
+    let primary_key = db_error(
+      sqlx::query("INSERT INTO vault_files VALUES('a','f1','another.txt')")
+        .execute(&mut connection)
+        .await
+        .unwrap_err(),
+    );
+    assert_eq!(
+      primary_key.status,
+      StatusCode::INTERNAL_SERVER_ERROR,
+      "an id collision is not a name conflict"
+    );
+  }
+
+  #[tokio::test]
+  async fn foreign_key_and_check_violations_are_server_errors() {
+    let mut connection = sqlx::SqliteConnection::connect("sqlite::memory:")
+      .await
+      .unwrap();
+    sqlx::query("PRAGMA foreign_keys=ON")
+      .execute(&mut connection)
+      .await
+      .unwrap();
+    sqlx::query("CREATE TABLE parent(id TEXT PRIMARY KEY)")
+      .execute(&mut connection)
+      .await
+      .unwrap();
+    sqlx::query(
+      "CREATE TABLE child(id TEXT PRIMARY KEY, parent_id TEXT NOT NULL REFERENCES parent(id))",
+    )
+    .execute(&mut connection)
+    .await
+    .unwrap();
+    sqlx::query("CREATE TABLE checked(value INTEGER CHECK(value > 0))")
+      .execute(&mut connection)
+      .await
+      .unwrap();
+
+    let foreign_key = db_error(
+      sqlx::query("INSERT INTO child VALUES('c','missing')")
+        .execute(&mut connection)
+        .await
+        .unwrap_err(),
+    );
+    assert_eq!(foreign_key.status, StatusCode::INTERNAL_SERVER_ERROR);
+
+    let check = db_error(
+      sqlx::query("INSERT INTO checked VALUES(0)")
+        .execute(&mut connection)
+        .await
+        .unwrap_err(),
+    );
+    assert_eq!(check.status, StatusCode::INTERNAL_SERVER_ERROR);
+  }
+
+  #[tokio::test]
+  async fn busy_violations_are_server_errors() {
+    let directory = tempfile::TempDir::new().unwrap();
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+      .filename(directory.path().join("busy.db"))
+      .create_if_missing(true)
+      .busy_timeout(Duration::ZERO);
+    let mut first = sqlx::SqliteConnection::connect_with(&options)
+      .await
+      .unwrap();
+    let mut second = sqlx::SqliteConnection::connect_with(&options)
+      .await
+      .unwrap();
+    sqlx::query("CREATE TABLE t(value INTEGER)")
+      .execute(&mut first)
+      .await
+      .unwrap();
+    sqlx::query("BEGIN IMMEDIATE")
+      .execute(&mut first)
+      .await
+      .unwrap();
+    let busy = sqlx::query("INSERT INTO t VALUES(1)")
+      .execute(&mut second)
+      .await
+      .unwrap_err();
+    assert!(
+      busy
+        .as_database_error()
+        .is_some_and(|error| error.code().as_deref() == Some("5")),
+      "expected SQLITE_BUSY, got {busy:?}"
+    );
+    assert_eq!(
+      db_error(busy).status,
+      StatusCode::INTERNAL_SERVER_ERROR,
+      "the write lock being held is not a name conflict"
+    );
   }
 }

@@ -492,6 +492,22 @@ async fn import_rejects_invalid_payloads_without_writing() {
   assert_eq!(status, 400, "{body}");
   assert!(body["error"]["VAULT_IMPORT_INVALID"].is_string(), "{body}");
 
+  let (status, body, _) = import(json!({
+    "folder": "Import",
+    "entries": [entry("ansi\u{1b}[2Jevil.txt", "", "value")]
+  }))
+  .await;
+  assert_eq!(status, 400, "{body}");
+  assert!(body["error"]["VAULT_IMPORT_INVALID"].is_string(), "{body}");
+
+  let (status, body, _) = import(json!({
+    "folder": "Import",
+    "entries": [entry("ok.txt", "ops\tprod", "value")]
+  }))
+  .await;
+  assert_eq!(status, 400, "{body}");
+  assert!(body["error"]["VAULT_IMPORT_INVALID"].is_string(), "{body}");
+
   let deep = vec!["a"; 33].join("/");
   assert!(
     deep.chars().count() <= 160,
@@ -575,6 +591,56 @@ async fn import_rejects_more_than_the_total_content_budget() {
   assert_eq!(status, 400, "{body}");
   assert!(body["error"]["VAULT_IMPORT_INVALID"].is_string(), "{body}");
   assert_eq!(vault_counts(&state, &admin.project_id).await, (0, 0, 0));
+}
+
+#[tokio::test]
+async fn import_rejects_more_than_the_total_revision_budget() {
+  let (_directory, state, router) = fixture().await;
+  let admin = admin_project(&router, &state).await;
+  // Empty revisions cost no content budget, so the revision count is the only
+  // bound on how many rows one import can insert under the write lock.
+  let entries: Vec<Value> = (0..6)
+    .map(|index| {
+      json!({
+        "name": format!("file-{index}.txt"),
+        "folder": "",
+        "kind": "text",
+        "versions": (0..1000)
+          .map(|_| json!({"encoding":"utf-8","content":""}))
+          .collect::<Vec<_>>()
+      })
+    })
+    .collect();
+  let (status, body, _) = call(
+    &router,
+    "POST",
+    &import_path(&admin),
+    Some(&admin.cookie),
+    Some(&admin.csrf),
+    Some(json!({"folder": "Import", "entries": entries})),
+  )
+  .await;
+  assert_eq!(status, 400, "{body}");
+  let message = body["error"]["VAULT_IMPORT_INVALID"]
+    .as_str()
+    .unwrap_or_else(|| panic!("expected VAULT_IMPORT_INVALID: {body}"));
+  assert!(
+    message.contains("5000") && message.contains("revisions"),
+    "the rejection must name the total revision limit: {message}"
+  );
+  assert_eq!(
+    vault_counts(&state, &admin.project_id).await,
+    (0, 0, 0),
+    "a rejected import must not write any rows"
+  );
+  let events: i64 = sqlx::query_scalar(
+    "SELECT COUNT(*) FROM audit_events WHERE action='vault.import.completed' AND project_id=?",
+  )
+  .bind(&admin.project_id)
+  .fetch_one(state.db.pool())
+  .await
+  .unwrap();
+  assert_eq!(events, 0);
 }
 
 #[tokio::test]

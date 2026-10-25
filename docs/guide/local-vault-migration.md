@@ -22,11 +22,22 @@ dopbase migrate local-vault \
 ```
 
 The backup path must not already exist. Dopbase creates it with owner-only
-permissions and verifies its bytes before sending values to the server. Every
-entry and folder name is checked against the Vault name rule before any write,
-so dry-run and a real import reject the same names (including `.` and `..`).
-Before writing, the CLI also rejects a destination folder that already exists
-as a top-level folder of the project, compared case-insensitively.
+permissions, hashes the bytes it wrote through the same open file descriptor,
+and syncs the parent directory before sending values to the server. Every entry
+and folder name is checked against the Vault name rule before any write, so
+dry-run and a real import reject the same names: 1 to 128 bytes, no path
+separators, no control characters, and neither `.` nor `..`. Before writing,
+the CLI also rejects a destination folder that already exists as a top-level
+folder of the project, compared case-insensitively. The container reader
+rejects an entry with more than 1000 revisions before the confirmation prompt
+and before the backup is written.
+
+An actual import sends the entire decrypted vault to the server. Dopbase
+refuses plain `http://` to a host other than `localhost`, a loopback IPv4
+address, or `::1`, and the refusal happens before the vault is read or the
+password is requested. Pass `--insecure-transport` to import over plain HTTP
+anyway; Dopbase warns on stderr. HTTPS and loopback plain HTTP need no flag,
+and `--dry-run` contacts nothing.
 
 The whole import is a single request to the server, and the server applies it
 in one transaction. A failed import writes nothing, so no partial folder tree
@@ -36,9 +47,9 @@ failed import leaves nothing to delete. Resolve the reported problem and run
 the import again.
 
 The server enforces the import limits: at most 1000 entries, 1000 revisions per
-entry, 1 MiB per revision, and 32 MiB in total. A folder path can have at most
-160 characters and 32 levels. An import that exceeds a limit is rejected before
-anything is written.
+entry, 5000 revisions across the whole import, 1 MiB per revision, and 32 MiB
+in total. A folder path can have at most 160 characters and 32 levels. An
+import that exceeds a limit is rejected before anything is written.
 
 Legacy folder paths become nested folders. SSH, Kubernetes, environment, and
 generic file entries retain their matching type; API entries become generic

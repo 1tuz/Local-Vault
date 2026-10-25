@@ -702,12 +702,27 @@ pub async fn restore_database_from_archive(
       .await?;
     }
 
-    // Wipe existing data
+    // Wipe existing data. Vault folders are referenced by projects with
+    // ON DELETE CASCADE and by their own parent_id with ON DELETE RESTRICT, so
+    // the tree has to be removed explicitly, leaves first, before projects.
     sqlx::query("DELETE FROM audit_events").execute(&mut *tx).await?;
     sqlx::query("DELETE FROM runner_tokens").execute(&mut *tx).await?;
     sqlx::query("DELETE FROM agent_tokens").execute(&mut *tx).await?;
     sqlx::query("DELETE FROM service_accounts").execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM secret_versions").execute(&mut *tx).await?;
     sqlx::query("DELETE FROM secrets").execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM vault_file_versions").execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM vault_files").execute(&mut *tx).await?;
+    loop {
+      let deleted = sqlx::query(
+        "DELETE FROM vault_folders WHERE NOT EXISTS (SELECT 1 FROM vault_folders child WHERE child.parent_id = vault_folders.id)",
+      )
+      .execute(&mut *tx)
+      .await?;
+      if deleted.rows_affected() == 0 {
+        break;
+      }
+    }
     sqlx::query("DELETE FROM environment_env_layout").execute(&mut *tx).await?;
     sqlx::query("DELETE FROM environments").execute(&mut *tx).await?;
     sqlx::query("DELETE FROM projects").execute(&mut *tx).await?;
@@ -728,6 +743,32 @@ pub async fn restore_database_from_archive(
     sqlx::query("INSERT INTO environments SELECT * FROM backup_db.environments").execute(&mut *tx).await?;
     sqlx::query("INSERT OR REPLACE INTO environment_env_layout SELECT * FROM backup_db.environment_env_layout").execute(&mut *tx).await?;
     sqlx::query("INSERT INTO secrets SELECT * FROM backup_db.secrets").execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO secret_versions SELECT * FROM backup_db.secret_versions").execute(&mut *tx).await?;
+    // Folders reference each other, so restore them parent-before-child.
+    sqlx::query(
+      r"WITH RECURSIVE tree(id, depth) AS (
+         SELECT id, 0 FROM backup_db.vault_folders WHERE parent_id IS NULL
+         UNION ALL
+         SELECT child.id, tree.depth + 1 FROM backup_db.vault_folders child JOIN tree ON child.parent_id = tree.id
+       )
+       INSERT INTO vault_folders(id, parent_id, name, created_at, updated_at, project_id, environment_id, is_root)
+       SELECT folder.id, folder.parent_id, folder.name, folder.created_at, folder.updated_at, folder.project_id, folder.environment_id, folder.is_root
+       FROM backup_db.vault_folders folder JOIN tree ON tree.id = folder.id ORDER BY tree.depth",
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+      r"INSERT INTO vault_files(id, folder_id, name, kind, version, ciphertext, value_nonce, wrapped_key, key_nonce, created_at, updated_at, encoding, environment_id)
+        SELECT id, folder_id, name, kind, version, ciphertext, value_nonce, wrapped_key, key_nonce, created_at, updated_at, encoding, environment_id FROM backup_db.vault_files",
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+      r"INSERT INTO vault_file_versions(file_id, version, ciphertext, value_nonce, wrapped_key, key_nonce, created_at, updated_at, archived_at, encoding)
+        SELECT file_id, version, ciphertext, value_nonce, wrapped_key, key_nonce, created_at, updated_at, archived_at, encoding FROM backup_db.vault_file_versions",
+    )
+    .execute(&mut *tx)
+    .await?;
     sqlx::query("INSERT INTO runner_tokens SELECT * FROM backup_db.runner_tokens").execute(&mut *tx).await?;
     sqlx::query("INSERT INTO audit_events SELECT * FROM backup_db.audit_events").execute(&mut *tx).await?;
 

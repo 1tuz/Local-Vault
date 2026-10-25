@@ -9,8 +9,17 @@ pub async fn find(
   pool: &SqlitePool,
   reference: &str,
 ) -> Result<Option<ProjectResponse>, sqlx::Error> {
-  sqlx::query_as("SELECT id,name,created_at,updated_at FROM projects WHERE id=? OR name=?")
-    .bind(reference)
+  // An ID always wins over a project name so that a project named like
+  // another project's ID cannot capture an ID-addressed lookup.
+  if let Some(project) =
+    sqlx::query_as("SELECT id,name,created_at,updated_at FROM projects WHERE id=?")
+      .bind(reference)
+      .fetch_optional(pool)
+      .await?
+  {
+    return Ok(Some(project));
+  }
+  sqlx::query_as("SELECT id,name,created_at,updated_at FROM projects WHERE name=?")
     .bind(reference)
     .fetch_optional(pool)
     .await

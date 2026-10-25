@@ -48,6 +48,20 @@ The database contains ciphertext, wrapped keys, nonces, versions, and safe
 metadata. The 256-bit master key remains in a separate owner-only file and is
 verified before the HTTP listener starts.
 
+## Backups and master-key changes
+
+A backup contains the whole Vault tree, every file revision, and archived
+secret versions in addition to projects, environments, secrets, and accounts.
+Restore removes Vault folders leaf-first and restores the snapshot's folders,
+files, versions, and archived secret versions, so a restored instance keeps the
+Vault content the backup holds.
+
+Changing the master key, whether from uploading a backup with a different key
+or restoring with `masterKey`, re-wraps the data key of every encrypted row:
+environment secrets, archived secret versions, Vault files, and archived Vault
+file revisions. A row that cannot be unwrapped fails the whole operation, so no
+data is left encrypted under the previous key.
+
 ## Data in transit
 
 Networked clients need an authenticated, encrypted connection to the server. Local development may use localhost, but a production deployment must not send credentials over an unprotected network.

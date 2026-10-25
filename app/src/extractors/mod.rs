@@ -5,6 +5,7 @@ use axum::{
   http::{HeaderMap, header, request::Parts},
 };
 use chrono::{Duration, Utc};
+use subtle::ConstantTimeEq;
 
 use crate::{
   constants::{
@@ -450,7 +451,7 @@ pub fn require_mutation(
     let expected = csrf_hash
       .as_ref()
       .ok_or_else(|| HttpError::forbidden(AUTHORIZATION_DENIED, CSRF_REQUIRED_MESSAGE))?;
-    if token::hash(provided) != *expected {
+    if token::hash(provided).ct_eq(expected).unwrap_u8() != 1 {
       return Err(HttpError::forbidden(
         AUTHORIZATION_DENIED,
         CSRF_REQUIRED_MESSAGE,

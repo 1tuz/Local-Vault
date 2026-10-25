@@ -49,8 +49,16 @@ pub async fn project_id(
   pool: &SqlitePool,
   project_ref: &str,
 ) -> Result<Option<String>, sqlx::Error> {
-  sqlx::query_scalar("SELECT id FROM projects WHERE id=? OR name=?")
+  // An ID always wins over a project name so that a project named like
+  // another project's ID cannot capture an ID-addressed lookup.
+  if let Some(id) = sqlx::query_scalar("SELECT id FROM projects WHERE id=?")
     .bind(project_ref)
+    .fetch_optional(pool)
+    .await?
+  {
+    return Ok(Some(id));
+  }
+  sqlx::query_scalar("SELECT id FROM projects WHERE name=?")
     .bind(project_ref)
     .fetch_optional(pool)
     .await

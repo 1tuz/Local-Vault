@@ -28,6 +28,16 @@ below are completed.**
   and restore versions, but deletion is limited to browser Admin UI sessions
   with CSRF protection. The UI can delete archived versions; the current
   version remains until its secret/file is deleted in the UI.
+- Backups contain the whole Vault tree, every file revision, and archived
+  secret versions in addition to projects, environments, secrets, and accounts.
+  Restore removes Vault folders leaf-first and restores the snapshot's folders,
+  files, versions, and archived secret versions; factory reset removes the same
+  rows explicitly.
+- A master-key rekey, whether from uploading a backup with a different key or
+  restoring with `masterKey`, re-wraps the data key of every encrypted row:
+  environment secrets, archived secret versions, Vault files, and archived
+  Vault file revisions. A row that cannot be unwrapped fails the whole
+  operation, so no row is left under the previous key.
 - Vault folders expose names, hierarchy, and project environment tags. Tags are
   metadata and inherit through folder ancestry. Typed file contents are
   encrypted;

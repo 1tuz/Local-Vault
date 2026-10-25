@@ -7,7 +7,7 @@
 
 /// Message returned with `VAULT_NAME_INVALID`.
 pub const NAME_INVALID_MESSAGE: &str =
-  "Names must be 1–128 bytes and cannot contain path separators.";
+  "Names must be 1–128 bytes and cannot contain path separators or control characters.";
 
 /// Validate a Vault folder or file name.
 ///
@@ -17,7 +17,8 @@ pub fn valid_name(name: &str) -> Result<String, &'static str> {
   let name = name.trim();
   if name.is_empty()
     || name.len() > 128
-    || name.chars().any(|value| matches!(value, '/' | '\\' | '\0'))
+    || name.chars().any(|value| matches!(value, '/' | '\\'))
+    || name.chars().any(char::is_control)
     || name == "."
     || name == ".."
   {
@@ -40,6 +41,10 @@ mod tests {
       "a/b",
       "a\\b",
       "nul\0name",
+      "ansi\u{1b}[31mred",
+      "tab\tname",
+      "line\nbreak",
+      "osc\u{1b}]0;title\u{7}name",
       &"n".repeat(129),
     ] {
       assert_eq!(

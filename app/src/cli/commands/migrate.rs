@@ -1,3 +1,4 @@
+use super::insecure_transport_warning;
 use crate::{
   cli::{client, output, prompt},
   constants::api,
@@ -11,10 +12,11 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
   collections::{HashMap, HashSet},
-  fs::OpenOptions,
-  io::Write,
+  fs::{File, OpenOptions},
+  io::{Read, Seek, SeekFrom, Write},
   path::{Path, PathBuf},
 };
+use url::{Host, Url};
 use zeroize::{Zeroize, Zeroizing};
 
 #[derive(Subcommand, Debug)]
@@ -31,7 +33,9 @@ Examples:
 
 The old password is prompted without echo. The source file is never modified.
 Actual imports require a new verified encrypted backup; --dry-run writes nothing.
-The import is applied atomically: a failure writes nothing to the project.";
+The import is applied atomically: a failure writes nothing to the project.
+Plain HTTP to a non-loopback server is refused because the whole decrypted
+vault is sent; pass --insecure-transport only on a trusted network.";
 
 #[derive(Args, Debug)]
 pub struct LocalVaultArgs {
@@ -53,6 +57,9 @@ pub struct LocalVaultArgs {
   /// Skip the final import confirmation (still requires the old vault password).
   #[arg(long)]
   yes: bool,
+  /// Send the decrypted vault over plain HTTP to a non-loopback server.
+  #[arg(long)]
+  insecure_transport: bool,
 }
 
 pub async fn execute(
@@ -66,11 +73,67 @@ pub async fn execute(
   Ok(0)
 }
 
+/// What the importer must do about the transport to the resolved server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransportDecision {
+  /// HTTPS, a loopback host, or a URL whose transport cannot leak: say nothing.
+  Silent,
+  /// Plain HTTP to a remote host with `--insecure-transport`: warn on stderr.
+  Warn,
+  /// Plain HTTP to a remote host without the opt-in: refuse before any read.
+  Refuse,
+}
+
+/// Classify the configured server URL without touching the network.
+///
+/// Loopback plain HTTP stays silent: nothing leaves the machine. A URL that
+/// cannot be parsed is refused rather than assumed safe, because the importer
+/// is about to send the whole decrypted vault to it.
+fn transport_decision(
+  server_url: &str,
+  allow_insecure: bool,
+) -> TransportDecision {
+  let Ok(url) = Url::parse(server_url) else {
+    return TransportDecision::Refuse;
+  };
+  if url.scheme() != "http" || is_loopback_host(&url) {
+    return TransportDecision::Silent;
+  }
+  if allow_insecure {
+    TransportDecision::Warn
+  } else {
+    TransportDecision::Refuse
+  }
+}
+
+fn is_loopback_host(url: &Url) -> bool {
+  match url.host() {
+    Some(Host::Ipv4(host)) => host.is_loopback(),
+    Some(Host::Ipv6(host)) => host.is_loopback(),
+    Some(Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+    None => false,
+  }
+}
+
+fn insecure_transport_refusal(server_url: &str) -> String {
+  format!(
+    "{}\nRefusing to send the decrypted Local Vault over plain HTTP. Pass --insecure-transport to import anyway.",
+    insecure_transport_warning(server_url)
+  )
+}
+
 async fn migrate_local_vault(
   server: &crate::cli::local_config::ResolvedServer,
   args: LocalVaultArgs,
   json_output: bool,
 ) -> Result<()> {
+  if !args.dry_run {
+    match transport_decision(&server.url, args.insecure_transport) {
+      TransportDecision::Silent => {}
+      TransportDecision::Warn => output::print_warning(&insecure_transport_warning(&server.url)),
+      TransportDecision::Refuse => bail!("{}", insecure_transport_refusal(&server.url)),
+    }
+  }
   let requested_source = args
     .file
     .map(expand_home)
@@ -352,7 +415,7 @@ fn create_verified_backup(
   encrypted: &[u8],
 ) -> Result<()> {
   let mut options = OpenOptions::new();
-  options.write(true).create_new(true);
+  options.read(true).write(true).create_new(true);
   #[cfg(unix)]
   {
     use std::os::unix::fs::OpenOptionsExt;
@@ -366,23 +429,68 @@ fn create_verified_backup(
       path.display()
     )
   })?;
-  if let Err(error) = file.write_all(encrypted).and_then(|()| file.sync_all()) {
+  if let Err(error) = write_and_verify_backup(&mut file, encrypted) {
+    drop(file);
     let _ = std::fs::remove_file(path);
-    return Err(error).context("could not write encrypted Local Vault backup");
+    return Err(error);
   }
   drop(file);
-  let written = match std::fs::read(path) {
-    Ok(written) => written,
-    Err(error) => {
-      let _ = std::fs::remove_file(path);
-      return Err(error).context("could not verify encrypted Local Vault backup");
-    }
-  };
-  if Sha256::digest(&written) != Sha256::digest(encrypted) {
+  if let Err(error) = sync_parent_directory(path) {
     let _ = std::fs::remove_file(path);
+    return Err(error);
+  }
+  Ok(())
+}
+
+/// Write the ciphertext and prove that the same descriptor holds exactly it.
+///
+/// The bytes are read back through the already-open `File`, never through a
+/// fresh `std::fs::read(path)`: reopening by path would let a symlink swap or
+/// a different (larger) file satisfy the check. The read is capped at the
+/// source length and one extra byte is probed to detect trailing data.
+fn write_and_verify_backup(
+  file: &mut File,
+  encrypted: &[u8],
+) -> Result<()> {
+  file
+    .write_all(encrypted)
+    .and_then(|()| file.sync_all())
+    .context("could not write encrypted Local Vault backup")?;
+  file
+    .seek(SeekFrom::Start(0))
+    .context("could not verify encrypted Local Vault backup")?;
+  let mut written = Zeroizing::new(vec![0_u8; encrypted.len()]);
+  file
+    .read_exact(&mut written)
+    .context("could not verify encrypted Local Vault backup")?;
+  let mut trailing = [0_u8; 1];
+  let trailing_bytes = file
+    .read(&mut trailing)
+    .context("could not verify encrypted Local Vault backup")?;
+  if trailing_bytes != 0 || Sha256::digest(written.as_slice()) != Sha256::digest(encrypted) {
     bail!("encrypted Local Vault backup verification failed");
   }
   Ok(())
+}
+
+/// Persist the directory entry so a crash right after the import cannot leave
+/// a backup that was reported as written but is absent from the filesystem.
+fn sync_parent_directory(path: &Path) -> Result<()> {
+  let parent = path
+    .parent()
+    .filter(|parent| !parent.as_os_str().is_empty())
+    .unwrap_or_else(|| Path::new("."));
+  #[cfg(unix)]
+  {
+    File::open(parent)
+      .and_then(|directory| directory.sync_all())
+      .with_context(|| format!("could not sync backup directory {}", parent.display()))
+  }
+  #[cfg(not(unix))]
+  {
+    let _ = parent;
+    Ok(())
+  }
 }
 
 /// Build the single atomic `POST /projects/{project}/files/import` body.
@@ -447,7 +555,8 @@ fn imported_counts(
 #[cfg(test)]
 mod tests {
   use super::{
-    destination_exists, folder_segments, import_payload, imported_counts, validate_file_name,
+    TransportDecision, create_verified_backup, destination_exists, folder_segments, import_payload,
+    imported_counts, insecure_transport_refusal, transport_decision, validate_file_name,
     validate_import,
   };
   use crate::{
@@ -824,5 +933,110 @@ mod tests {
 
     let invalid: Value = json!({"folders": "many"});
     assert_eq!(imported_counts(&invalid, (1, 2, 3)), (1, 2, 3));
+  }
+
+  #[test]
+  fn classifies_plain_http_transport_before_any_vault_is_read() {
+    for secure in [
+      "https://dopbase.example.com",
+      "https://localhost:8840",
+      "http://localhost:8840",
+      "http://127.0.0.1:8840",
+      "http://127.8.8.8:8840",
+      "http://[::1]:8840",
+      "http://LOCALHOST:8840",
+    ] {
+      assert_eq!(
+        transport_decision(secure, false),
+        TransportDecision::Silent,
+        "{secure} must neither warn nor refuse"
+      );
+      assert_eq!(
+        transport_decision(secure, true),
+        TransportDecision::Silent,
+        "{secure} must stay silent even with --insecure-transport"
+      );
+    }
+
+    assert_eq!(
+      transport_decision("http://dopbase.internal:8840", false),
+      TransportDecision::Refuse,
+      "plain HTTP to a remote host sends the decrypted vault in the clear"
+    );
+    assert_eq!(
+      transport_decision("http://dopbase.internal:8840", true),
+      TransportDecision::Warn,
+      "--insecure-transport opts in with a warning"
+    );
+    assert_eq!(
+      transport_decision("http://10.0.0.5:8840", false),
+      TransportDecision::Refuse
+    );
+    assert_eq!(
+      transport_decision("not a server url", false),
+      TransportDecision::Refuse,
+      "an unparseable URL cannot be proven safe and must be refused"
+    );
+  }
+
+  #[test]
+  fn refusal_reuses_the_shared_insecure_transport_warning() {
+    let url = "http://dopbase.internal:8840";
+    let refusal = insecure_transport_refusal(url);
+    assert!(
+      refusal.contains(&crate::cli::commands::insecure_transport_warning(url)),
+      "the refusal must embed the warning shared with `client connect`: {refusal}"
+    );
+    assert!(refusal.contains("--insecure-transport"), "{refusal}");
+    assert!(
+      refusal.contains("decrypted Local Vault"),
+      "the refusal must name what leaks: {refusal}"
+    );
+  }
+
+  #[test]
+  fn writes_a_verified_backup_and_refuses_to_overwrite_it() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("backup.vault");
+    create_verified_backup(&path, b"sealed-ciphertext").expect("backup must be written");
+    assert_eq!(std::fs::read(&path).unwrap(), b"sealed-ciphertext");
+    #[cfg(unix)]
+    {
+      use std::os::unix::fs::PermissionsExt;
+      assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600,
+        "the backup must stay owner-only"
+      );
+    }
+
+    let error = create_verified_backup(&path, b"other").expect_err("an existing file must win");
+    assert!(
+      format!("{error:#}").contains("without overwriting"),
+      "{error:#}"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), b"sealed-ciphertext");
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn refuses_to_write_a_backup_through_a_symlink() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let target = directory.path().join("target.vault");
+    std::fs::write(&target, b"keep").unwrap();
+    let link = directory.path().join("backup.vault");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let error = create_verified_backup(&link, b"sealed-ciphertext")
+      .expect_err("a symlink at the backup path must be refused");
+    assert!(
+      format!("{error:#}").contains("without overwriting"),
+      "{error:#}"
+    );
+    assert_eq!(
+      std::fs::read(&target).unwrap(),
+      b"keep",
+      "the symlink target must be untouched"
+    );
   }
 }
