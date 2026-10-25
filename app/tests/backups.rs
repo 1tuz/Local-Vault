@@ -990,3 +990,586 @@ fn backup_names_reject_path_syntax_and_deceptive_extensions() {
     );
   }
 }
+
+const VAULT_KUBECONFIG_V1: &str = "apiVersion: v1\nkind: Config\nclusters:\n  - name: prod\n";
+const VAULT_KUBECONFIG_V2: &str = "apiVersion: v1\nkind: Config\nclusters:\n  - name: prod-v2\n";
+const VAULT_SSH_KEY: &str =
+  "-----BEGIN OPENSSH PRIVATE KEY-----\nbackup-seed\n-----END OPENSSH PRIVATE KEY-----\n";
+const VAULT_SECRET_V1: &str = "token-version-one";
+const VAULT_SECRET_V2: &str = "token-version-two";
+
+struct VaultSeed {
+  project_id: String,
+  environment_id: String,
+  parent_folder_id: String,
+  child_folder_id: String,
+  file_id: String,
+  sibling_file_id: String,
+}
+
+/// Build a project Vault with a nested tree, a two-revision file, a sibling
+/// file and a two-revision secret. Both the current value and the archived
+/// revision therefore have to survive a backup/restore round trip.
+async fn seed_vault(
+  router: &Router,
+  token: &str,
+  project_name: &str,
+) -> VaultSeed {
+  let (status, project, _) = call(
+    router,
+    "POST",
+    "/api/v1/projects",
+    Some(token),
+    Some(json!({"name": project_name})),
+  )
+  .await;
+  assert_eq!(status, 201);
+  let project_id = project["data"]["id"].as_str().unwrap().to_owned();
+
+  let (status, environment, _) = call(
+    router,
+    "POST",
+    &format!("/api/v1/projects/{project_id}/environments"),
+    Some(token),
+    Some(json!({"name": "production"})),
+  )
+  .await;
+  assert_eq!(status, 201);
+  let environment_id = environment["data"]["id"].as_str().unwrap().to_owned();
+
+  let files = format!("/api/v1/projects/{project_id}/files");
+
+  let (status, parent, _) = call(
+    router,
+    "POST",
+    &format!("{files}/folders"),
+    Some(token),
+    Some(json!({"name": "clusters", "environmentId": environment_id})),
+  )
+  .await;
+  assert_eq!(status, 201);
+  let parent_folder_id = parent["data"]["id"].as_str().unwrap().to_owned();
+
+  let (status, child, _) = call(
+    router,
+    "POST",
+    &format!("{files}/folders"),
+    Some(token),
+    Some(json!({"name": "production", "parentId": parent_folder_id})),
+  )
+  .await;
+  assert_eq!(status, 201);
+  let child_folder_id = child["data"]["id"].as_str().unwrap().to_owned();
+
+  let (status, file, _) = call(
+    router,
+    "POST",
+    &format!("{files}/folders/{child_folder_id}/files"),
+    Some(token),
+    Some(json!({
+      "name": "kubeconfig",
+      "kind": "kubeconfig",
+      "content": VAULT_KUBECONFIG_V1,
+      "encoding": "utf-8",
+      "environmentId": environment_id,
+    })),
+  )
+  .await;
+  assert_eq!(status, 201);
+  assert_eq!(file["data"]["version"], 1);
+  let file_id = file["data"]["id"].as_str().unwrap().to_owned();
+
+  let (status, updated, _) = call(
+    router,
+    "PUT",
+    &format!("{files}/{file_id}"),
+    Some(token),
+    Some(json!({"content": VAULT_KUBECONFIG_V2})),
+  )
+  .await;
+  assert_eq!(status, 200);
+  assert_eq!(updated["data"]["version"], 2);
+
+  let (status, sibling, _) = call(
+    router,
+    "POST",
+    &format!("{files}/folders/{parent_folder_id}/files"),
+    Some(token),
+    Some(json!({
+      "name": "deploy-key",
+      "kind": "sshPrivateKey",
+      "content": VAULT_SSH_KEY,
+    })),
+  )
+  .await;
+  assert_eq!(status, 201);
+  let sibling_file_id = sibling["data"]["id"].as_str().unwrap().to_owned();
+
+  let secret_path = format!("/api/v1/environments/{environment_id}/secrets/API_TOKEN");
+  let (status, _, _) = call(
+    router,
+    "PUT",
+    &secret_path,
+    Some(token),
+    Some(json!({"value": VAULT_SECRET_V1})),
+  )
+  .await;
+  assert_eq!(status, 200);
+  let (status, _, _) = call(
+    router,
+    "PUT",
+    &secret_path,
+    Some(token),
+    Some(json!({"value": VAULT_SECRET_V2})),
+  )
+  .await;
+  assert_eq!(status, 200);
+
+  VaultSeed {
+    project_id,
+    environment_id,
+    parent_folder_id,
+    child_folder_id,
+    file_id,
+    sibling_file_id,
+  }
+}
+
+async fn reveal_vault_file(
+  router: &Router,
+  token: &str,
+  project_id: &str,
+  file_id: &str,
+) -> String {
+  let (status, body, _) = call(
+    router,
+    "POST",
+    &format!("/api/v1/projects/{project_id}/files/{file_id}/reveal"),
+    Some(token),
+    None,
+  )
+  .await;
+  assert_eq!(status, 200);
+  body["data"]["content"].as_str().unwrap().to_owned()
+}
+
+async fn reveal_secret(
+  router: &Router,
+  token: &str,
+  environment_id: &str,
+  key: &str,
+) -> String {
+  let (status, body, _) = call(
+    router,
+    "POST",
+    &format!("/api/v1/environments/{environment_id}/secrets/{key}/reveal"),
+    Some(token),
+    None,
+  )
+  .await;
+  assert_eq!(status, 200);
+  body["data"]["value"].as_str().unwrap().to_owned()
+}
+
+#[tokio::test]
+async fn restore_recovers_vault_tree_files_and_archived_versions() {
+  let (_dir, state, router, token) = admin_setup().await;
+  let seed = seed_vault(&router, &token, "vault-restore-project").await;
+  let files = format!("/api/v1/projects/{}/files", seed.project_id);
+
+  // Take the snapshot while the tree, the current file value, the archived
+  // file revision and the archived secret revision all exist.
+  let (status, backup, _) = call(
+    &router,
+    "POST",
+    "/api/v1/backups",
+    Some(&token),
+    Some(json!({"name": "vault_snapshot"})),
+  )
+  .await;
+  assert_eq!(status, 201);
+  let backup_key = backup["data"]["key"].as_str().unwrap().to_owned();
+
+  // Diverge after the snapshot: new file revision, deleted files, deleted
+  // folder, extra folder and a deleted secret.
+  let (status, _, _) = call(
+    &router,
+    "PUT",
+    &format!("{files}/{}", seed.file_id),
+    Some(&token),
+    Some(json!({"content": "mutated after backup"})),
+  )
+  .await;
+  assert_eq!(status, 200);
+  for file_id in [&seed.file_id, &seed.sibling_file_id] {
+    sqlx::query("DELETE FROM vault_files WHERE id = ?")
+      .bind(file_id)
+      .execute(state.db.pool())
+      .await
+      .unwrap();
+  }
+  sqlx::query("DELETE FROM vault_folders WHERE id = ?")
+    .bind(&seed.child_folder_id)
+    .execute(state.db.pool())
+    .await
+    .unwrap();
+  let (status, _, _) = call(
+    &router,
+    "POST",
+    &format!("{files}/folders"),
+    Some(&token),
+    Some(json!({"name": "post-backup"})),
+  )
+  .await;
+  assert_eq!(status, 201);
+  sqlx::query("DELETE FROM secrets WHERE environment_id = ? AND key = 'API_TOKEN'")
+    .bind(&seed.environment_id)
+    .execute(state.db.pool())
+    .await
+    .unwrap();
+
+  let (status, _, _) = call(
+    &router,
+    "POST",
+    &format!("/api/v1/backups/{backup_key}/restore"),
+    Some(&token),
+    None,
+  )
+  .await;
+  assert_eq!(status, 200);
+
+  // Folder tree is back, including the nested child and without the folder
+  // created after the snapshot.
+  let (status, tree, _) = call(&router, "GET", &format!("{files}/tree"), Some(&token), None).await;
+  assert_eq!(status, 200);
+  let tree = tree["data"].as_array().unwrap();
+  let mut folder_names: Vec<&str> = tree
+    .iter()
+    .map(|entry| entry["folder"]["name"].as_str().unwrap())
+    .collect();
+  folder_names.sort();
+  assert_eq!(folder_names, vec!["Project root", "clusters", "production"]);
+  assert_eq!(
+    tree
+      .iter()
+      .find(|entry| entry["folder"]["id"] == seed.child_folder_id)
+      .unwrap()["files"][0]["id"],
+    seed.file_id
+  );
+  assert_eq!(
+    tree
+      .iter()
+      .find(|entry| entry["folder"]["id"] == seed.parent_folder_id)
+      .unwrap()["files"][0]["id"],
+    seed.sibling_file_id
+  );
+
+  // The restore keeps the audit trail that existed in the snapshot.
+  let audit_count: i64 =
+    sqlx::query_scalar("SELECT COUNT(*) FROM audit_events WHERE project_id = ?")
+      .bind(&seed.project_id)
+      .fetch_one(state.db.pool())
+      .await
+      .unwrap();
+  assert!(audit_count > 0);
+
+  let folder_count: i64 =
+    sqlx::query_scalar("SELECT COUNT(*) FROM vault_folders WHERE project_id = ? AND is_root = 0")
+      .bind(&seed.project_id)
+      .fetch_one(state.db.pool())
+      .await
+      .unwrap();
+  assert_eq!(folder_count, 2);
+  let file_count: i64 =
+    sqlx::query_scalar("SELECT COUNT(*) FROM vault_files WHERE folder_id IN (SELECT id FROM vault_folders WHERE project_id = ?)")
+      .bind(&seed.project_id)
+      .fetch_one(state.db.pool())
+      .await
+      .unwrap();
+  assert_eq!(file_count, 2);
+  let archived_file_count: i64 =
+    sqlx::query_scalar("SELECT COUNT(*) FROM vault_file_versions WHERE file_id = ?")
+      .bind(&seed.file_id)
+      .fetch_one(state.db.pool())
+      .await
+      .unwrap();
+  assert_eq!(archived_file_count, 1);
+  let archived_secret_count: i64 = sqlx::query_scalar(
+    "SELECT COUNT(*) FROM secret_versions WHERE environment_id = ? AND key = 'API_TOKEN'",
+  )
+  .bind(&seed.environment_id)
+  .fetch_one(state.db.pool())
+  .await
+  .unwrap();
+  assert_eq!(archived_secret_count, 1);
+
+  // Current and archived file contents decrypt byte-exactly.
+  assert_eq!(
+    reveal_vault_file(&router, &token, &seed.project_id, &seed.file_id).await,
+    VAULT_KUBECONFIG_V2
+  );
+  assert_eq!(
+    reveal_vault_file(&router, &token, &seed.project_id, &seed.sibling_file_id).await,
+    VAULT_SSH_KEY
+  );
+  let (status, file_versions, _) = call(
+    &router,
+    "GET",
+    &format!("{files}/{}/versions", seed.file_id),
+    Some(&token),
+    None,
+  )
+  .await;
+  assert_eq!(status, 200);
+  let file_versions = file_versions["data"].as_array().unwrap();
+  assert_eq!(file_versions.len(), 1);
+  assert_eq!(file_versions[0]["version"], 1);
+  let (status, _, _) = call(
+    &router,
+    "POST",
+    &format!("{files}/{}/versions/1/rollback", seed.file_id),
+    Some(&token),
+    None,
+  )
+  .await;
+  assert_eq!(status, 200);
+  assert_eq!(
+    reveal_vault_file(&router, &token, &seed.project_id, &seed.file_id).await,
+    VAULT_KUBECONFIG_V1
+  );
+
+  // Secret current value and archived revision decrypt byte-exactly.
+  assert_eq!(
+    reveal_secret(&router, &token, &seed.environment_id, "API_TOKEN").await,
+    VAULT_SECRET_V2
+  );
+  let (status, secret_versions, _) = call(
+    &router,
+    "GET",
+    &format!(
+      "/api/v1/environments/{}/secrets/API_TOKEN/versions",
+      seed.environment_id
+    ),
+    Some(&token),
+    None,
+  )
+  .await;
+  assert_eq!(status, 200);
+  let secret_versions = secret_versions["data"].as_array().unwrap();
+  assert_eq!(secret_versions.len(), 1);
+  assert_eq!(secret_versions[0]["version"], 1);
+  let (status, _, _) = call(
+    &router,
+    "POST",
+    &format!(
+      "/api/v1/environments/{}/secrets/API_TOKEN/rollback",
+      seed.environment_id
+    ),
+    Some(&token),
+    Some(json!({"version": 1})),
+  )
+  .await;
+  assert_eq!(status, 200);
+  assert_eq!(
+    reveal_secret(&router, &token, &seed.environment_id, "API_TOKEN").await,
+    VAULT_SECRET_V1
+  );
+}
+
+async fn upload_backup_with_master_key(
+  router: &Router,
+  token: &str,
+  filename: &str,
+  backup_bytes: &[u8],
+  master_key: &[u8],
+) -> String {
+  let boundary = "---------------------------backupvaultupload";
+  let mut body = Vec::new();
+  body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+  body.extend_from_slice(
+    format!("Content-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n")
+      .as_bytes(),
+  );
+  body.extend_from_slice(b"Content-Type: application/octet-stream\r\n\r\n");
+  body.extend_from_slice(backup_bytes);
+  body.extend_from_slice(format!("\r\n--{boundary}\r\n").as_bytes());
+  body.extend_from_slice(
+    b"Content-Disposition: form-data; name=\"master_key\"; filename=\"master.key\"\r\n",
+  );
+  body.extend_from_slice(b"Content-Type: application/octet-stream\r\n\r\n");
+  body.extend_from_slice(master_key);
+  body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+  let request = Request::builder()
+    .method("POST")
+    .uri("/api/v1/backups/upload")
+    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+    .header(
+      header::CONTENT_TYPE,
+      format!("multipart/form-data; boundary={boundary}"),
+    )
+    .body(Body::from(body))
+    .unwrap();
+  let response = router.clone().oneshot(request).await.unwrap();
+  assert_eq!(response.status().as_u16(), 201);
+  let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+  let json: Value = serde_json::from_slice(&bytes).unwrap();
+  json["data"]["key"].as_str().unwrap().to_owned()
+}
+
+#[tokio::test]
+async fn vault_data_still_decrypts_after_cross_master_key_restore() {
+  // Server 1 owns the Vault and the backup.
+  let (dir1, _state1, router1, token1) = admin_setup().await;
+  let seed = seed_vault(&router1, &token1, "vault-cross-key-project").await;
+  let (status, backup, _) = call(
+    &router1,
+    "POST",
+    "/api/v1/backups",
+    Some(&token1),
+    Some(json!({"name": "vault_cross_key"})),
+  )
+  .await;
+  assert_eq!(status, 201);
+  let backup_key = backup["data"]["key"].as_str().unwrap().to_owned();
+  let (status, raw_backup, _) = call_raw(
+    &router1,
+    "GET",
+    &format!("/api/v1/backups/{backup_key}"),
+    Some(&token1),
+  )
+  .await;
+  assert_eq!(status, 200);
+  let server1_key = std::fs::read(dir1.path().join("master.key")).unwrap();
+
+  // Server 2 has its own master key. Uploading the backup re-keys the snapshot
+  // to that key, and restoring then copies the Vault rows into the live db.
+  let (dir2, _state2, router2, token2) = admin_setup().await;
+  let server2_key = std::fs::read(dir2.path().join("master.key")).unwrap();
+  assert_ne!(server1_key, server2_key);
+
+  let uploaded_key = upload_backup_with_master_key(
+    &router2,
+    &token2,
+    "vault_migrated.dop",
+    &raw_backup,
+    &server1_key,
+  )
+  .await;
+  let (status, _, _) = call(
+    &router2,
+    "POST",
+    &format!("/api/v1/backups/{uploaded_key}/restore"),
+    Some(&token2),
+    None,
+  )
+  .await;
+  assert_eq!(status, 200);
+
+  // Server 2's key file must not be replaced by the source server's key.
+  assert_eq!(
+    std::fs::read(dir2.path().join("master.key")).unwrap(),
+    server2_key
+  );
+
+  // Current file value, archived file revision, current secret value and
+  // archived secret revision all still decrypt under the target key.
+  assert_eq!(
+    reveal_vault_file(&router2, &token2, &seed.project_id, &seed.file_id).await,
+    VAULT_KUBECONFIG_V2
+  );
+  assert_eq!(
+    reveal_vault_file(&router2, &token2, &seed.project_id, &seed.sibling_file_id).await,
+    VAULT_SSH_KEY
+  );
+  let files = format!("/api/v1/projects/{}/files", seed.project_id);
+  let (status, _, _) = call(
+    &router2,
+    "POST",
+    &format!("{files}/{}/versions/1/rollback", seed.file_id),
+    Some(&token2),
+    None,
+  )
+  .await;
+  assert_eq!(status, 200);
+  assert_eq!(
+    reveal_vault_file(&router2, &token2, &seed.project_id, &seed.file_id).await,
+    VAULT_KUBECONFIG_V1
+  );
+
+  assert_eq!(
+    reveal_secret(&router2, &token2, &seed.environment_id, "API_TOKEN").await,
+    VAULT_SECRET_V2
+  );
+  let (status, _, _) = call(
+    &router2,
+    "POST",
+    &format!(
+      "/api/v1/environments/{}/secrets/API_TOKEN/rollback",
+      seed.environment_id
+    ),
+    Some(&token2),
+    Some(json!({"version": 1})),
+  )
+  .await;
+  assert_eq!(status, 200);
+  assert_eq!(
+    reveal_secret(&router2, &token2, &seed.environment_id, "API_TOKEN").await,
+    VAULT_SECRET_V1
+  );
+
+  // The restore endpoint itself also re-keys. Drop the original backup (still
+  // encrypted with server 1's key) into server 2's backup directory and
+  // restore it while supplying that source key in the request body.
+  let direct_key = "vault_direct.dop";
+  let backup_dir = dir2.path().join("backups");
+  std::fs::create_dir_all(&backup_dir).unwrap();
+  std::fs::write(backup_dir.join(direct_key), &raw_backup).unwrap();
+  let (status, body, _) = call(
+    &router2,
+    "POST",
+    &format!("/api/v1/backups/{direct_key}/restore"),
+    Some(&token2),
+    Some(json!({"master_key": hex::encode(&server1_key)})),
+  )
+  .await;
+  assert_eq!(status, 200, "direct restore failed: {body}");
+
+  assert_eq!(
+    reveal_vault_file(&router2, &token2, &seed.project_id, &seed.file_id).await,
+    VAULT_KUBECONFIG_V2
+  );
+  let (status, _, _) = call(
+    &router2,
+    "POST",
+    &format!("{files}/{}/versions/1/rollback", seed.file_id),
+    Some(&token2),
+    None,
+  )
+  .await;
+  assert_eq!(status, 200);
+  assert_eq!(
+    reveal_vault_file(&router2, &token2, &seed.project_id, &seed.file_id).await,
+    VAULT_KUBECONFIG_V1
+  );
+  assert_eq!(
+    reveal_secret(&router2, &token2, &seed.environment_id, "API_TOKEN").await,
+    VAULT_SECRET_V2
+  );
+  let (status, _, _) = call(
+    &router2,
+    "POST",
+    &format!(
+      "/api/v1/environments/{}/secrets/API_TOKEN/rollback",
+      seed.environment_id
+    ),
+    Some(&token2),
+    Some(json!({"version": 1})),
+  )
+  .await;
+  assert_eq!(status, 200);
+  assert_eq!(
+    reveal_secret(&router2, &token2, &seed.environment_id, "API_TOKEN").await,
+    VAULT_SECRET_V1
+  );
+}

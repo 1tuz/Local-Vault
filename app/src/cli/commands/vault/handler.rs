@@ -39,7 +39,7 @@ pub(crate) async fn execute(
     } => client::secret_writer_client(server).await?,
     VaultCommand::File {
       command: FileCommand::Reveal { .. },
-    } => client::recently_authenticated_client(server).await?,
+    } => client::human_client(server).await?,
     _ => client::human_client(server).await?,
   };
   match command {

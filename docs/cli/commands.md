@@ -127,14 +127,42 @@ automation. No other command contacts GitHub.
 
 `dopbase migrate local-vault` imports the retired encrypted `LVLT0001` file
 into the Dopbase Vault tree. It asks for the old password without echo, refuses
-an existing destination folder, and never modifies the source. An actual import
-requires a new backup path; the CLI writes the encrypted file there with
-owner-only permissions and verifies its contents before importing.
+an existing destination folder (compared case-insensitively), and never
+modifies the source. An actual import requires a new backup path; the CLI
+writes the encrypted file there with owner-only permissions, hashes the bytes
+it wrote through the same file descriptor, and syncs the parent directory
+before importing.
 
-Use `--dry-run` to validate the file and preview counts before importing. Value
-revisions and nested folder paths are preserved. See the
-[Local Vault migration guide](/guide/local-vault-migration) for type mappings,
-base64 behavior, and limitations.
+| Option                 | Purpose                                                               |
+| ---------------------- | --------------------------------------------------------------------- |
+| `--project <REF>`      | Project name or ID that receives the import                           |
+| `--file <PATH>`        | Legacy vault file, default `~/.local/share/local-vault/secrets.vault` |
+| `--folder <NAME>`      | New top-level folder for the imported hierarchy                       |
+| `--backup <PATH>`      | New encrypted backup path, required for a real import                 |
+| `--dry-run`            | Validate and preview counts without writing anything                  |
+| `--yes`                | Skip the final import confirmation                                    |
+| `--insecure-transport` | Allow plain HTTP to a non-loopback server                             |
+
+Use `--dry-run` to validate the file and preview counts before importing. Names
+are checked against the Vault name rule before any write, so a rejected name
+never reaches the server. A name must be 1 to 128 bytes, must not contain path
+separators or control characters, and must not be `.` or `..`. The whole import
+is one server request, so a failed import writes nothing: no folder or file is
+created, and the source file and the encrypted backup stay intact. Value
+revisions and nested folder paths are preserved.
+
+A real import sends the whole decrypted vault to the server. Dopbase therefore
+refuses plain `http://` to any host other than `localhost`, a loopback IPv4
+address, or `::1` before reading the vault or prompting for the password. Pass
+`--insecure-transport` to import anyway; the command warns on stderr.
+`--dry-run` contacts no server and is unaffected.
+
+The server enforces the import limits: at most 1000 entries, 1000 revisions per
+entry, 5000 revisions across the whole import, 1 MiB per revision, and 32 MiB
+of content in total. A folder path can have at most 160 characters and 32
+levels. An import that exceeds a limit is rejected before anything is written.
+See the [Local Vault migration guide](/guide/local-vault-migration) for type
+mappings, base64 behavior, and limitations.
 
 The server resolution order is:
 
@@ -399,9 +427,10 @@ dopbase files payment-service file rollback production/cluster/kubeconfig 2
 dopbase files payment-service file reveal production/cluster/kubeconfig
 ```
 
-Reveal requires recent human authentication. MCP exposes file metadata only and
-does not reveal file contents. Use the Admin UI to delete files, empty folders,
-or individual archived versions. `vault` remains a CLI alias for `files`.
+Reveal requires an authenticated project-manager session. MCP exposes file
+metadata only and does not reveal file contents. Use the Admin UI to delete
+files, empty folders, or individual archived versions. `vault` remains a CLI
+alias for `files`.
 
 ## Import and export
 

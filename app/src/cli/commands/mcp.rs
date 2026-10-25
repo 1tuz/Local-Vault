@@ -10,7 +10,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 const MODERN_PROTOCOL_VERSION: &str = "2026-07-28";
 const LEGACY_PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26"];
-const INSTRUCTIONS: &str = "MCP can read project metadata and, with a project-scoped token, create, version, and move typed project files. File IDs stay stable after moves; call dopbase_list_project_files to refresh the hierarchy. Secret values are never returned, and deletion is available only in the Admin UI.";
+const INSTRUCTIONS: &str = "MCP can read project metadata and, with a project-scoped token, create, version, and move typed project files. File IDs stay stable after moves; call dopbase_list_project_files to refresh the hierarchy. Secret and project-file contents are never returned. Never ask for the Dopbase administrator password; it cannot enable MCP content access. If content is needed, explain this limitation and direct the user to the Admin UI. Deletion is available only in the Admin UI.";
 
 #[derive(Subcommand, Debug)]
 pub enum McpCommand {

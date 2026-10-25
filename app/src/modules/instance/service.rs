@@ -171,10 +171,12 @@ pub async fn factory_reset(
       "runner_tokens",
       "agent_tokens",
       "service_accounts",
+      "secret_versions",
       "secrets",
+      "vault_file_versions",
+      "vault_files",
       "environment_env_layout",
       "environments",
-      "projects",
       "sessions",
       "admins",
     ] {
@@ -182,6 +184,21 @@ pub async fn factory_reset(
         .execute(&mut *tx)
         .await?;
     }
+    // Folder parents use ON DELETE RESTRICT, so remove leaves before the
+    // project cascade reaches the tree.
+    loop {
+      let deleted = sqlx::query(
+        "DELETE FROM vault_folders WHERE NOT EXISTS (SELECT 1 FROM vault_folders child WHERE child.parent_id = vault_folders.id)",
+      )
+      .execute(&mut *tx)
+      .await?;
+      if deleted.rows_affected() == 0 {
+        break;
+      }
+    }
+    sqlx::query("DELETE FROM projects")
+      .execute(&mut *tx)
+      .await?;
     tx.commit().await?;
     // Best-effort scrub: deleted secret ciphertext must not linger in the
     // database file or WAL after a reset.

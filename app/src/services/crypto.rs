@@ -296,12 +296,14 @@ pub async fn rekey_database(
 
   for (env_id, secret_key, version, wrapped_key, key_nonce) in rows {
     let secret_aad = aad(&env_id, &secret_key, version);
-    let data_key = old_crypto
-      .decrypt_master(&wrapped_key, &key_nonce, &secret_aad)
-      .with_context(|| {
-        format!("failed to unwrap secret {env_id}:{secret_key} with provided master key")
-      })?;
-    let (new_wrapped, new_nonce) = new_crypto.encrypt_master(&data_key, &secret_aad)?;
+    let (new_wrapped, new_nonce) = rewrap_data_key(
+      &old_crypto,
+      &new_crypto,
+      &wrapped_key,
+      &key_nonce,
+      &secret_aad,
+      || format!("failed to unwrap secret {env_id}:{secret_key} with provided master key"),
+    )?;
     sqlx::query(
       "UPDATE secrets SET wrapped_key = ?, key_nonce = ? WHERE environment_id = ? AND key = ?",
     )
@@ -313,8 +315,114 @@ pub async fn rekey_database(
     .await?;
   }
 
+  // 3. Re-wrap data keys in archived secret versions
+  type SecretVersionKeyRow = (String, String, i64, Vec<u8>, Vec<u8>);
+  let rows: Vec<SecretVersionKeyRow> = sqlx::query_as(
+    "SELECT environment_id, key, version, wrapped_key, key_nonce FROM secret_versions",
+  )
+  .fetch_all(&mut *tx)
+  .await?;
+
+  for (env_id, secret_key, version, wrapped_key, key_nonce) in rows {
+    let secret_aad = aad(&env_id, &secret_key, version);
+    let (new_wrapped, new_nonce) = rewrap_data_key(
+      &old_crypto,
+      &new_crypto,
+      &wrapped_key,
+      &key_nonce,
+      &secret_aad,
+      || {
+        format!(
+          "failed to unwrap archived secret {env_id}:{secret_key} version {version} with provided master key"
+        )
+      },
+    )?;
+    sqlx::query(
+      "UPDATE secret_versions SET wrapped_key = ?, key_nonce = ? WHERE environment_id = ? AND key = ? AND version = ?",
+    )
+    .bind(new_wrapped)
+    .bind(new_nonce)
+    .bind(&env_id)
+    .bind(&secret_key)
+    .bind(version)
+    .execute(&mut *tx)
+    .await?;
+  }
+
+  // 4. Re-wrap data keys in vault files. The AAD binds the file id rather than
+  // an environment, so it has to be rebuilt from the row's own coordinates.
+  type VaultFileKeyRow = (String, i64, Vec<u8>, Vec<u8>);
+  let rows: Vec<VaultFileKeyRow> =
+    sqlx::query_as("SELECT id, version, wrapped_key, key_nonce FROM vault_files")
+      .fetch_all(&mut *tx)
+      .await?;
+
+  for (id, version, wrapped_key, key_nonce) in rows {
+    let file_aad = aad(&id, "vault-file", version);
+    let (new_wrapped, new_nonce) = rewrap_data_key(
+      &old_crypto,
+      &new_crypto,
+      &wrapped_key,
+      &key_nonce,
+      &file_aad,
+      || format!("failed to unwrap vault file {id} version {version} with provided master key"),
+    )?;
+    sqlx::query("UPDATE vault_files SET wrapped_key = ?, key_nonce = ? WHERE id = ?")
+      .bind(new_wrapped)
+      .bind(new_nonce)
+      .bind(&id)
+      .execute(&mut *tx)
+      .await?;
+  }
+
+  // 5. Re-wrap data keys in archived vault file versions
+  type VaultFileVersionKeyRow = (String, i64, Vec<u8>, Vec<u8>);
+  let rows: Vec<VaultFileVersionKeyRow> =
+    sqlx::query_as("SELECT file_id, version, wrapped_key, key_nonce FROM vault_file_versions")
+      .fetch_all(&mut *tx)
+      .await?;
+
+  for (file_id, version, wrapped_key, key_nonce) in rows {
+    let file_aad = aad(&file_id, "vault-file", version);
+    let (new_wrapped, new_nonce) = rewrap_data_key(
+      &old_crypto,
+      &new_crypto,
+      &wrapped_key,
+      &key_nonce,
+      &file_aad,
+      || {
+        format!(
+          "failed to unwrap archived vault file {file_id} version {version} with provided master key"
+        )
+      },
+    )?;
+    sqlx::query(
+      "UPDATE vault_file_versions SET wrapped_key = ?, key_nonce = ? WHERE file_id = ? AND version = ?",
+    )
+    .bind(new_wrapped)
+    .bind(new_nonce)
+    .bind(&file_id)
+    .bind(version)
+    .execute(&mut *tx)
+    .await?;
+  }
+
   tx.commit().await?;
   Ok(())
+}
+
+fn rewrap_data_key(
+  old_crypto: &CryptoService,
+  new_crypto: &CryptoService,
+  wrapped_key: &[u8],
+  key_nonce: &[u8],
+  aad: &[u8],
+  description: impl FnOnce() -> String,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+  let data_key = old_crypto
+    .decrypt_master(wrapped_key, key_nonce, aad)
+    .with_context(description)?;
+  new_crypto.encrypt_master(&data_key, aad)
 }
 
 pub fn parse_master_key(input: &[u8]) -> Result<Vec<u8>> {

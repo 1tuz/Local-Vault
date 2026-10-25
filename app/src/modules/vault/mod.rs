@@ -1,6 +1,7 @@
 use crate::state::AppState;
 use axum::{
   Router,
+  extract::DefaultBodyLimit,
   routing::{delete, get, post, put},
 };
 
@@ -9,6 +10,7 @@ pub mod doc;
 pub mod model;
 mod repository;
 pub mod service;
+pub mod validation;
 
 pub fn routes() -> Router<AppState> {
   Router::new()
@@ -62,5 +64,13 @@ pub fn routes() -> Router<AppState> {
     .route(
       crate::constants::api::vault::FILE_REVEAL,
       post(controller::reveal_file),
+    )
+    .merge(
+      Router::new()
+        .route(
+          crate::constants::api::vault::IMPORT,
+          post(controller::import),
+        )
+        .layer(DefaultBodyLimit::max(64 * 1024 * 1024)),
     )
 }

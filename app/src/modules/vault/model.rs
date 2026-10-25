@@ -140,3 +140,41 @@ pub struct RevealedVaultFile {
   pub content: String,
   pub version: i64,
 }
+
+/// One atomic Vault import: a new top-level folder plus every file below it.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportVaultRequest {
+  /// Name of the new top-level folder that receives the imported tree.
+  pub folder: String,
+  pub entries: Vec<ImportEntry>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportEntry {
+  pub name: String,
+  /// Nested folder path below the imported root; `/` and `\` both separate
+  /// segments and an empty value places the file at the root.
+  #[serde(default)]
+  pub folder: String,
+  pub kind: VaultFileKind,
+  /// Revisions in ascending order; the last one becomes the current version.
+  pub versions: Vec<ImportVersion>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportVersion {
+  pub encoding: String,
+  pub content: String,
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct VaultImportSummary {
+  pub folder_id: String,
+  pub folders: usize,
+  pub files: usize,
+  pub versions: usize,
+}

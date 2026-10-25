@@ -136,6 +136,52 @@ async fn rekey_database_preserves_values_and_swaps_keys() {
   .await
   .unwrap();
 
+  sqlx::query(
+    "CREATE TABLE secret_versions (
+      environment_id TEXT NOT NULL,
+      key TEXT NOT NULL,
+      version INTEGER NOT NULL,
+      ciphertext BLOB NOT NULL,
+      value_nonce BLOB NOT NULL,
+      wrapped_key BLOB NOT NULL,
+      key_nonce BLOB NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      archived_at TEXT NOT NULL,
+      PRIMARY KEY(environment_id, key, version)
+    );",
+  )
+  .execute(&pool)
+  .await
+  .unwrap();
+  sqlx::query(
+    "CREATE TABLE vault_files (
+      id TEXT PRIMARY KEY,
+      version INTEGER NOT NULL,
+      ciphertext BLOB NOT NULL,
+      value_nonce BLOB NOT NULL,
+      wrapped_key BLOB NOT NULL,
+      key_nonce BLOB NOT NULL
+    );",
+  )
+  .execute(&pool)
+  .await
+  .unwrap();
+  sqlx::query(
+    "CREATE TABLE vault_file_versions (
+      file_id TEXT NOT NULL,
+      version INTEGER NOT NULL,
+      ciphertext BLOB NOT NULL,
+      value_nonce BLOB NOT NULL,
+      wrapped_key BLOB NOT NULL,
+      key_nonce BLOB NOT NULL,
+      PRIMARY KEY(file_id, version)
+    );",
+  )
+  .execute(&pool)
+  .await
+  .unwrap();
+
   let (old_key, new_key) = distinct_keys();
   let old_crypto = CryptoService::from_key(old_key.clone());
   let new_crypto = CryptoService::from_key(new_key.clone());
@@ -168,6 +214,58 @@ async fn rekey_database_preserves_values_and_swaps_keys() {
   .bind(&encrypted.key_nonce)
   .bind("2026-09-05T00:00:00Z")
   .bind("2026-09-05T00:00:00Z")
+  .execute(&pool)
+  .await
+  .unwrap();
+
+  let archived_secret = old_crypto
+    .encrypt(b"previous-secret-value", "env_test", "DB_PASS", 0)
+    .unwrap();
+  sqlx::query(
+    "INSERT INTO secret_versions (environment_id, key, version, ciphertext, value_nonce, wrapped_key, key_nonce, created_at, updated_at, archived_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+  )
+  .bind("env_test")
+  .bind("DB_PASS")
+  .bind(0_i64)
+  .bind(&archived_secret.ciphertext)
+  .bind(&archived_secret.value_nonce)
+  .bind(&archived_secret.wrapped_key)
+  .bind(&archived_secret.key_nonce)
+  .bind("2026-09-05T00:00:00Z")
+  .bind("2026-09-05T00:00:00Z")
+  .bind("2026-09-05T00:00:00Z")
+  .execute(&pool)
+  .await
+  .unwrap();
+
+  let vault_file = old_crypto
+    .encrypt(b"kubeconfig-current", "vault_file_test", "vault-file", 2)
+    .unwrap();
+  sqlx::query(
+    "INSERT INTO vault_files (id, version, ciphertext, value_nonce, wrapped_key, key_nonce) VALUES (?, ?, ?, ?, ?, ?)",
+  )
+  .bind("vault_file_test")
+  .bind(2_i64)
+  .bind(&vault_file.ciphertext)
+  .bind(&vault_file.value_nonce)
+  .bind(&vault_file.wrapped_key)
+  .bind(&vault_file.key_nonce)
+  .execute(&pool)
+  .await
+  .unwrap();
+
+  let vault_file_version = old_crypto
+    .encrypt(b"kubeconfig-archived", "vault_file_test", "vault-file", 1)
+    .unwrap();
+  sqlx::query(
+    "INSERT INTO vault_file_versions (file_id, version, ciphertext, value_nonce, wrapped_key, key_nonce) VALUES (?, ?, ?, ?, ?, ?)",
+  )
+  .bind("vault_file_test")
+  .bind(1_i64)
+  .bind(&vault_file_version.ciphertext)
+  .bind(&vault_file_version.value_nonce)
+  .bind(&vault_file_version.wrapped_key)
+  .bind(&vault_file_version.key_nonce)
   .execute(&pool)
   .await
   .unwrap();
@@ -212,5 +310,71 @@ async fn rekey_database_preserves_values_and_swaps_keys() {
       .unwrap()
       .as_slice(),
     cleartext
+  );
+
+  let archived_row: (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) = sqlx::query_as(
+    "SELECT ciphertext, value_nonce, wrapped_key, key_nonce FROM secret_versions WHERE environment_id = ? AND key = ? AND version = ?",
+  )
+  .bind("env_test")
+  .bind("DB_PASS")
+  .bind(0_i64)
+  .fetch_one(&pool)
+  .await
+  .unwrap();
+  let archived = EncryptedValue {
+    ciphertext: archived_row.0,
+    value_nonce: archived_row.1,
+    wrapped_key: archived_row.2,
+    key_nonce: archived_row.3,
+  };
+  assert_eq!(
+    new_crypto
+      .decrypt(&archived, "env_test", "DB_PASS", 0)
+      .unwrap()
+      .as_slice(),
+    b"previous-secret-value"
+  );
+
+  let file_row: (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) = sqlx::query_as(
+    "SELECT ciphertext, value_nonce, wrapped_key, key_nonce FROM vault_files WHERE id = ?",
+  )
+  .bind("vault_file_test")
+  .fetch_one(&pool)
+  .await
+  .unwrap();
+  let file = EncryptedValue {
+    ciphertext: file_row.0,
+    value_nonce: file_row.1,
+    wrapped_key: file_row.2,
+    key_nonce: file_row.3,
+  };
+  assert_eq!(
+    new_crypto
+      .decrypt(&file, "vault_file_test", "vault-file", 2)
+      .unwrap()
+      .as_slice(),
+    b"kubeconfig-current"
+  );
+
+  let version_row: (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) = sqlx::query_as(
+    "SELECT ciphertext, value_nonce, wrapped_key, key_nonce FROM vault_file_versions WHERE file_id = ? AND version = ?",
+  )
+  .bind("vault_file_test")
+  .bind(1_i64)
+  .fetch_one(&pool)
+  .await
+  .unwrap();
+  let version = EncryptedValue {
+    ciphertext: version_row.0,
+    value_nonce: version_row.1,
+    wrapped_key: version_row.2,
+    key_nonce: version_row.3,
+  };
+  assert_eq!(
+    new_crypto
+      .decrypt(&version, "vault_file_test", "vault-file", 1)
+      .unwrap()
+      .as_slice(),
+    b"kubeconfig-archived"
   );
 }

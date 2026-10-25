@@ -268,3 +268,19 @@ pub async fn reveal_file(
     "VAULT_FILE_REVEALED",
   ))
 }
+
+/// Import a whole Local Vault hierarchy in one atomic request.
+#[utoipa::path(post, path = crate::constants::api::vault::IMPORT, tag = "project files", security(("bearerAuth" = []), ("cookieAuth" = [])), request_body=ImportVaultRequest, responses((status=201, description="Folder tree imported atomically", body=inline(HttpResponseFormat<VaultImportSummary>)), (status=400, description="The import payload is invalid"), (status=409, description="The destination folder already exists")))]
+pub async fn import(
+  State(state): State<AppState>,
+  headers: HeaderMap,
+  identity: AuthIdentity,
+  Path(project_ref): Path<String>,
+  axum::Json(request): axum::Json<ImportVaultRequest>,
+) -> Result<HttpResponse<VaultImportSummary>, HttpError> {
+  service::authorize_project_write(&state, &identity, &headers, &project_ref).await?;
+  Ok(HttpResponse::created(
+    service::import(&state, &identity, &project_ref, request).await?,
+    "VAULT_IMPORT_COMPLETED",
+  ))
+}

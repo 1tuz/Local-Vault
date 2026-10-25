@@ -642,6 +642,7 @@ async function saveDetailEnvironment(): Promise<void> {
 
 async function copyContent(): Promise<void> {
   if (!revealed.value) return;
+  error.value = "";
   try {
     await navigator.clipboard.writeText(revealed.value.content);
     showNotice("Copied to clipboard.");
